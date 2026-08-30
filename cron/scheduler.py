@@ -336,6 +336,8 @@ def _is_cron_silence_response(text: str) -> bool:
 # ---------------------------------------------------------------------------
 _parallel_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
 _parallel_pool_max_workers: Optional[int] = None
+_no_agent_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
+_no_agent_pool_max_workers: Optional[int] = None
 _running_job_ids: set = set()
 _running_lock = threading.Lock()
 
@@ -512,6 +514,26 @@ def _get_parallel_pool(max_workers: Optional[int]) -> concurrent.futures.ThreadP
     return _parallel_pool
 
 
+def _get_no_agent_pool(max_workers: Optional[int]) -> concurrent.futures.ThreadPoolExecutor:
+    """Return the persistent pool reserved for script-only jobs.
+
+    ``no_agent`` jobs launch subprocesses and do not need an agent worker or
+    the process-global ``TERMINAL_CWD`` bridge. Keeping them out of both agent
+    pools prevents a long workdir agent, or a saturated parallel agent pool,
+    from delaying script-only monitors before they have even started.
+    """
+    global _no_agent_pool, _no_agent_pool_max_workers
+    if _no_agent_pool is None or _no_agent_pool_max_workers != max_workers:
+        if _no_agent_pool is not None:
+            _no_agent_pool.shutdown(wait=False, cancel_futures=False)
+        _no_agent_pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="cron-no-agent",
+        )
+        _no_agent_pool_max_workers = max_workers
+    return _no_agent_pool
+
+
 def _get_sequential_pool() -> concurrent.futures.ThreadPoolExecutor:
     """Return (or create) the persistent single-thread sequential pool.
 
@@ -531,11 +553,16 @@ def _get_sequential_pool() -> concurrent.futures.ThreadPoolExecutor:
 
 def _shutdown_parallel_pool() -> None:
     """Shut down the persistent pools on process exit."""
-    global _parallel_pool, _parallel_pool_max_workers, _sequential_pool
+    global _parallel_pool, _parallel_pool_max_workers
+    global _no_agent_pool, _no_agent_pool_max_workers, _sequential_pool
     if _parallel_pool is not None:
         _parallel_pool.shutdown(wait=True, cancel_futures=False)
         _parallel_pool = None
         _parallel_pool_max_workers = None
+    if _no_agent_pool is not None:
+        _no_agent_pool.shutdown(wait=True, cancel_futures=False)
+        _no_agent_pool = None
+        _no_agent_pool_max_workers = None
     if _sequential_pool is not None:
         _sequential_pool.shutdown(wait=True, cancel_futures=False)
         _sequential_pool = None
@@ -2110,7 +2137,10 @@ def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str
     return str(interpreter), env_overlay
 
 
-def _run_job_script(script_path: str) -> tuple[bool, str]:
+def _run_job_script(
+    script_path: str,
+    workdir: Optional[str] = None,
+) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
     Scripts must reside within HERMES_HOME/scripts/.  Both relative and
@@ -2136,6 +2166,8 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
         script_path: Path to the script.  Relative paths are resolved
             against HERMES_HOME/scripts/.  Absolute and ~-prefixed paths
             are also validated to ensure they stay within the scripts dir.
+        workdir: Optional absolute path to use as the script's cwd. The
+            scheduler process cwd is never mutated.
 
     Returns:
         (success, output) — on failure *output* contains the error message so the
@@ -2206,12 +2238,13 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
             }
         env = _sanitize_subprocess_env(os.environ.copy())
         env.update(env_overlay)
+        script_cwd = workdir or str(path.parent)
         result = subprocess.run(
             argv,
             capture_output=True,
             text=True,
             timeout=script_timeout,
-            cwd=str(path.parent),
+            cwd=script_cwd,
             env=env,
             **popen_kwargs,
         )
@@ -2245,7 +2278,7 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
 
 
 def _run_job_script_with_claim_heartbeat(
-    job: dict, script_path: str
+    job: dict, script_path: str, workdir: Optional[str] = None,
 ) -> tuple[bool, str]:
     """Run a cron script while keeping its owned one-shot claim fresh.
 
@@ -2267,7 +2300,7 @@ def _run_job_script_with_claim_heartbeat(
         and schedule.get("kind") == "once"
         and owner
     ):
-        return _run_job_script(script_path)
+        return _run_job_script(script_path, workdir=workdir)
 
     job_id = str(job.get("id") or "")
     stop = threading.Event()
@@ -2298,10 +2331,10 @@ def _run_job_script_with_claim_heartbeat(
             job_id,
             exc_info=True,
         )
-        return _run_job_script(script_path)
+        return _run_job_script(script_path, workdir=workdir)
 
     try:
-        return _run_job_script(script_path)
+        return _run_job_script(script_path, workdir=workdir)
     finally:
         stop.set()
         # Event.wait() wakes immediately.  Keep completion bounded if the
@@ -2704,25 +2737,26 @@ def run_job(
             return False, "", "", err
 
         # Apply workdir if configured — lets scripts use predictable relative
-        # paths. For no_agent jobs this is just the subprocess cwd (not an
-        # agent TERMINAL_CWD bridge).
+        # paths. Pass it to the subprocess rather than changing process-global
+        # cwd, which would leak across concurrent scheduler and gateway work.
         _job_workdir = (job.get("workdir") or "").strip() or None
-        _prior_cwd = None
-        if _job_workdir and Path(_job_workdir).is_dir():
-            _prior_cwd = os.getcwd()
-            try:
-                os.chdir(_job_workdir)
-            except OSError:
-                _prior_cwd = None
+        if _job_workdir and not Path(_job_workdir).is_dir():
+            logger.warning(
+                "Job '%s': configured workdir %r no longer exists — running without it",
+                job_id,
+                _job_workdir,
+            )
+            _job_workdir = None
 
         try:
-            ok, output = _run_job_script_with_claim_heartbeat(job, script_path)
-        finally:
-            if _prior_cwd is not None:
-                try:
-                    os.chdir(_prior_cwd)
-                except OSError:
-                    pass
+            ok, output = _run_job_script_with_claim_heartbeat(
+                job, script_path, workdir=_job_workdir,
+            )
+        except Exception:
+            logger.exception(
+                "Job '%s': script execution raised unexpectedly", job_id,
+            )
+            ok, output = False, "Script execution failed"
 
         now_iso = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -3982,14 +4016,18 @@ def tick(
             body."""
             return run_one_job(job, adapters=adapters, loop=loop, verbose=verbose)
 
-        # Partition due jobs: those with a per-job workdir mutate
-        # os.environ["TERMINAL_CWD"] inside run_job, which is process-global, so
-        # they queue on the single-thread sequential pool to run one at a time.
-        # That alone only keeps workdir jobs from overlapping EACH OTHER;
-        # run_job's _terminal_cwd_lock is what additionally stops a concurrently
-        # firing workdir-less parallel-pool job from observing the override.
-        sequential_jobs = [j for j in due_jobs if (j.get("workdir") or "").strip()]
-        parallel_jobs = [j for j in due_jobs if not (j.get("workdir") or "").strip()]
+        # Script-only jobs use a dedicated pool. Their workdir is passed to the
+        # subprocess as ``cwd`` and never mutates the scheduler process. Agent
+        # jobs retain the workdir split because workdir agents bridge through
+        # process-global TERMINAL_CWD and must remain sequential.
+        no_agent_jobs = [j for j in due_jobs if j.get("no_agent")]
+        agent_jobs = [j for j in due_jobs if not j.get("no_agent")]
+        sequential_jobs = [
+            j for j in agent_jobs if (j.get("workdir") or "").strip()
+        ]
+        parallel_jobs = [
+            j for j in agent_jobs if not (j.get("workdir") or "").strip()
+        ]
 
         _results: list = []
         _all_futures: list = []
@@ -4056,7 +4094,19 @@ def tick(
                 )
                 return None
 
-        # Sequential pass for env-mutating (workdir) jobs.
+        # Script-only pass — isolated from both agent pools so a slow or
+        # saturated agent lane cannot consume every worker needed by a monitor.
+        if no_agent_jobs:
+            no_agent_pool = _get_no_agent_pool(_max_workers)
+            for job in no_agent_jobs:
+                fut = _submit_with_guard(job, no_agent_pool)
+                if fut is None:
+                    continue
+                _all_futures.append(fut)
+                if not sync:
+                    _results.append(True)  # optimistically counted
+
+        # Sequential pass for env-mutating (workdir) agent jobs.
         # Queued to a persistent single-thread pool so they run one at a time
         # WITHOUT blocking the ticker thread — a long workdir job no
         # longer starves the rest of the schedule (same fix as the parallel

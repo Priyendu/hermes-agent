@@ -196,6 +196,89 @@ class TestCronjobToolWorkdir:
 # scheduler.tick(): workdir partition
 # ---------------------------------------------------------------------------
 
+class TestNoAgentSubprocessWorkdir:
+    def test_explicit_workdir_does_not_mutate_scheduler_cwd(
+        self, tmp_path, monkeypatch,
+    ):
+        import os
+        import cron.scheduler as sched
+
+        hermes_home = tmp_path / "home"
+        scripts_dir = hermes_home / "scripts"
+        scripts_dir.mkdir(parents=True)
+        workdir = tmp_path / "job-workdir"
+        workdir.mkdir()
+        (scripts_dir / "cwd_probe.py").write_text(
+            "import os; print(os.getcwd())\n", encoding="utf-8"
+        )
+
+        monkeypatch.setattr(sched, "_get_hermes_home", lambda: hermes_home)
+        scheduler_cwd = os.getcwd()
+
+        ok, output = sched._run_job_script(
+            "cwd_probe.py", workdir=str(workdir),
+        )
+
+        assert ok, output
+        assert output == str(workdir)
+        assert os.getcwd() == scheduler_cwd
+
+    def test_no_agent_run_never_changes_process_cwd_while_script_is_live(
+        self, tmp_path, monkeypatch,
+    ):
+        import os
+        import threading
+        import time
+        import cron.scheduler as sched
+
+        hermes_home = tmp_path / "home"
+        scripts_dir = hermes_home / "scripts"
+        scripts_dir.mkdir(parents=True)
+        workdir = tmp_path / "job-workdir"
+        workdir.mkdir()
+        (scripts_dir / "blocking_probe.py").write_text(
+            "from pathlib import Path\n"
+            "import time\n"
+            "Path('started').write_text('yes', encoding='utf-8')\n"
+            "deadline = time.monotonic() + 5\n"
+            "while not Path('release').exists() and time.monotonic() < deadline:\n"
+            "    time.sleep(0.01)\n"
+            "print(Path.cwd())\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr(sched, "_get_hermes_home", lambda: hermes_home)
+        scheduler_cwd = os.getcwd()
+        result = []
+
+        thread = threading.Thread(
+            target=lambda: result.append(
+                sched.run_job({
+                    "id": "cwd-isolation",
+                    "name": "cwd-isolation",
+                    "no_agent": True,
+                    "script": "blocking_probe.py",
+                    "workdir": str(workdir),
+                    "schedule": {"kind": "every", "every": "1m"},
+                })
+            )
+        )
+        thread.start()
+        deadline = time.monotonic() + 3
+        while not (workdir / "started").exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        try:
+            assert (workdir / "started").exists(), "probe did not start"
+            assert os.getcwd() == scheduler_cwd
+        finally:
+            (workdir / "release").write_text("go", encoding="utf-8")
+            thread.join(timeout=3)
+
+        assert not thread.is_alive()
+        assert result and result[0][0] is True
+        assert os.getcwd() == scheduler_cwd
+
 class TestTickWorkdirPartition:
     """
     tick() must run workdir jobs sequentially (outside the ThreadPoolExecutor)
@@ -207,12 +290,23 @@ class TestTickWorkdirPartition:
     def test_workdir_jobs_run_sequentially(self, tmp_path, monkeypatch):
         import cron.scheduler as sched
 
-        # Two workdir jobs (both sequential) + one parallel job.
+        # Two workdir agents, one parallel agent, and one script-only workdir.
         workdir_a = {"id": "a", "name": "A", "workdir": str(tmp_path)}
         workdir_b = {"id": "b", "name": "B", "workdir": str(tmp_path)}
         parallel_job = {"id": "c", "name": "C", "workdir": None}
+        script_job = {
+            "id": "d",
+            "name": "D",
+            "workdir": str(tmp_path),
+            "no_agent": True,
+            "script": "probe.py",
+        }
 
-        monkeypatch.setattr(sched, "get_due_jobs", lambda: [workdir_a, workdir_b, parallel_job])
+        monkeypatch.setattr(
+            sched,
+            "get_due_jobs",
+            lambda: [workdir_a, workdir_b, parallel_job, script_job],
+        )
         monkeypatch.setattr(sched, "advance_next_run", lambda *_a, **_kw: None)
 
         # Record call order / thread context.
@@ -234,7 +328,7 @@ class TestTickWorkdirPartition:
         )
 
         n = sched.tick(verbose=False)
-        assert n == 3
+        assert n == 4
 
         ids = [c[0] for c in calls]
         # Sequential workdir jobs preserve submission order relative to each
@@ -250,6 +344,8 @@ class TestTickWorkdirPartition:
             assert workdir_thread_name.startswith("cron-seq"), workdir_thread_name
         par_thread_name = next(t for j, t in calls if j == "c")
         assert par_thread_name.startswith("cron-parallel"), par_thread_name
+        script_thread_name = next(t for j, t in calls if j == "d")
+        assert script_thread_name.startswith("cron-no-agent"), script_thread_name
 
 
 # ---------------------------------------------------------------------------
