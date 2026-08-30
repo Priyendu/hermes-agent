@@ -695,6 +695,8 @@ def _is_cron_silence_response(text: str) -> bool:
 # ---------------------------------------------------------------------------
 _parallel_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
 _parallel_pool_max_workers: Optional[int] = None
+_no_agent_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
+_no_agent_pool_max_workers: Optional[int] = None
 _running_job_ids: set = set()
 _running_fire_owners: dict[str, dict[object, tuple[Optional[str], Path]]] = {}
 _running_lock = threading.Lock()
@@ -1462,6 +1464,26 @@ def _get_parallel_pool(max_workers: Optional[int]) -> concurrent.futures.ThreadP
     return _parallel_pool
 
 
+def _get_no_agent_pool(max_workers: Optional[int]) -> concurrent.futures.ThreadPoolExecutor:
+    """Return the persistent pool reserved for script-only jobs.
+
+    ``no_agent`` jobs launch subprocesses and do not need an agent worker or
+    the process-global ``TERMINAL_CWD`` bridge.  Keeping them out of both
+    agent pools prevents a long workdir agent, or a saturated parallel agent
+    pool, from delaying script-only monitors before they have even started.
+    """
+    global _no_agent_pool, _no_agent_pool_max_workers
+    if _no_agent_pool is None or _no_agent_pool_max_workers != max_workers:
+        if _no_agent_pool is not None:
+            _no_agent_pool.shutdown(wait=False, cancel_futures=False)
+        _no_agent_pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="cron-no-agent",
+        )
+        _no_agent_pool_max_workers = max_workers
+    return _no_agent_pool
+
+
 def _get_sequential_pool() -> concurrent.futures.ThreadPoolExecutor:
     """Return (or create) the persistent single-thread sequential pool.
 
@@ -1481,11 +1503,16 @@ def _get_sequential_pool() -> concurrent.futures.ThreadPoolExecutor:
 
 def _shutdown_parallel_pool() -> None:
     """Shut down the persistent pools on process exit."""
-    global _parallel_pool, _parallel_pool_max_workers, _sequential_pool
+    global _parallel_pool, _parallel_pool_max_workers
+    global _no_agent_pool, _no_agent_pool_max_workers, _sequential_pool
     if _parallel_pool is not None:
         _parallel_pool.shutdown(wait=True, cancel_futures=False)
         _parallel_pool = None
         _parallel_pool_max_workers = None
+    if _no_agent_pool is not None:
+        _no_agent_pool.shutdown(wait=True, cancel_futures=False)
+        _no_agent_pool = None
+        _no_agent_pool_max_workers = None
     if _sequential_pool is not None:
         _sequential_pool.shutdown(wait=True, cancel_futures=False)
         _sequential_pool = None
@@ -7919,14 +7946,20 @@ def tick(
                 verbose=verbose,
             )
 
-        # Partition due jobs: those with a per-job workdir mutate
-        # os.environ["TERMINAL_CWD"] inside run_job, which is process-global, so
-        # they queue on the single-thread sequential pool to run one at a time.
-        # That alone only keeps workdir jobs from overlapping EACH OTHER;
-        # run_job's _terminal_cwd_lock is what additionally stops a concurrently
-        # firing workdir-less parallel-pool job from observing the override.
-        sequential_jobs = [j for j in due_jobs if (j.get("workdir") or "").strip()]
-        parallel_jobs = [j for j in due_jobs if not (j.get("workdir") or "").strip()]
+        # Script-only jobs have their own pool.  Their workdir is passed to the
+        # subprocess as ``cwd`` and never mutates the scheduler process, so
+        # serializing them behind workdir agents is both unnecessary and a
+        # latency hazard for script-only monitors.  Agent jobs retain the
+        # workdir split: workdir agents mutate process-global TERMINAL_CWD and
+        # must remain sequential, while workdir-less agents may run in parallel.
+        no_agent_jobs = [j for j in due_jobs if j.get("no_agent")]
+        agent_jobs = [j for j in due_jobs if not j.get("no_agent")]
+        sequential_jobs = [
+            j for j in agent_jobs if (j.get("workdir") or "").strip()
+        ]
+        parallel_jobs = [
+            j for j in agent_jobs if not (j.get("workdir") or "").strip()
+        ]
 
         _results: list = []
         _all_futures: list = []
@@ -8042,7 +8075,19 @@ def tick(
                     _running_futures[job_id] = fut
             return fut
 
-        # Sequential pass for env-mutating (workdir) jobs.
+        # Script-only pass — isolated from both agent pools so a slow or
+        # saturated agent lane cannot consume every worker needed by a monitor.
+        if no_agent_jobs:
+            no_agent_pool = _get_no_agent_pool(_max_workers)
+            for job in no_agent_jobs:
+                fut = _submit_with_guard(job, no_agent_pool)
+                if fut is None:
+                    continue
+                _all_futures.append(fut)
+                if not sync:
+                    _results.append(True)  # optimistically counted
+
+        # Sequential pass for env-mutating (workdir) agent jobs.
         # Queued to a persistent single-thread pool so they run one at a time
         # WITHOUT blocking the ticker thread — a long workdir job no
         # longer starves the rest of the schedule (same fix as the parallel

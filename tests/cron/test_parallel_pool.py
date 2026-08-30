@@ -43,6 +43,21 @@ class TestPersistentPool:
         assert sched._parallel_pool is None
         assert sched._parallel_pool_max_workers is None
 
+    def test_no_agent_pool_is_reused_and_shutdown(self):
+        """Script-only jobs have a persistent pool independent of agents."""
+        import cron.scheduler as sched
+
+        sched._no_agent_pool = None
+        sched._no_agent_pool_max_workers = None
+
+        pool1 = sched._get_no_agent_pool(2)
+        pool2 = sched._get_no_agent_pool(2)
+        assert pool1 is pool2
+
+        sched._shutdown_parallel_pool()
+        assert sched._no_agent_pool is None
+        assert sched._no_agent_pool_max_workers is None
+
 
 class TestRunningJobGuard:
     """_running_job_ids prevents double-dispatch of active jobs."""
@@ -375,6 +390,68 @@ class TestSequentialPool:
 
         sched._shutdown_parallel_pool()
         assert sched._sequential_pool is None
+
+    def test_no_agent_workdir_starts_while_both_agent_pools_are_saturated(
+        self, tmp_path, monkeypatch,
+    ):
+        """A script monitor must not queue behind either class of agent.
+
+        This is an event-driven reproduction of the field failure: one agent
+        occupies the parallel pool and another occupies the workdir pool.  A
+        workdir-bearing no-agent monitor must still start on its own executor.
+        """
+        import cron.scheduler as sched
+
+        sched._parallel_pool = None
+        sched._parallel_pool_max_workers = None
+        sched._no_agent_pool = None
+        sched._no_agent_pool_max_workers = None
+        sched._sequential_pool = None
+        sched._running_job_ids.clear()
+
+        release_agents = threading.Event()
+        parallel_blocker = sched._get_parallel_pool(1).submit(
+            release_agents.wait
+        )
+        sequential_blocker = sched._get_sequential_pool().submit(
+            release_agents.wait
+        )
+
+        monitor_started = threading.Event()
+        monitor = {
+            "id": "script-monitor",
+            "name": "script-monitor",
+            "script": "monitor.py",
+            "no_agent": True,
+            "workdir": str(tmp_path),
+            "schedule": "every 1m",
+            "enabled": True,
+            "next_run_at": "2020-01-01T00:00:00",
+            "deliver": "local",
+        }
+
+        monkeypatch.setattr(sched, "get_due_jobs", lambda: [monitor])
+        monkeypatch.setattr(
+            sched,
+            "claim_job_for_fire",
+            lambda *_a, **_kw: dict(monitor),
+        )
+        monkeypatch.setattr(
+            sched,
+            "run_one_job",
+            lambda *_a, **_kw: monitor_started.set() or True,
+        )
+
+        try:
+            assert sched.tick(verbose=False, sync=False) == 1
+            assert monitor_started.wait(timeout=2), (
+                "no_agent monitor queued behind a saturated agent pool"
+            )
+        finally:
+            release_agents.set()
+            parallel_blocker.result(timeout=2)
+            sequential_blocker.result(timeout=2)
+            sched._shutdown_parallel_pool()
 
 
 class TestTickBatchAdvance:

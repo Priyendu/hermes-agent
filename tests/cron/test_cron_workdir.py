@@ -148,12 +148,24 @@ class TestTickWorkdirPartition:
     def test_workdir_jobs_run_sequentially(self, tmp_path, monkeypatch):
         import cron.scheduler as sched
 
-        # Two workdir jobs (both sequential) + one parallel job.
+        # Two workdir agents (both sequential), one parallel agent, and one
+        # script-only workdir job on its dedicated executor.
         workdir_a = {"id": "a", "name": "A", "workdir": str(tmp_path)}
         workdir_b = {"id": "b", "name": "B", "workdir": str(tmp_path)}
         parallel_job = {"id": "c", "name": "C", "workdir": None}
+        script_job = {
+            "id": "d",
+            "name": "D",
+            "workdir": str(tmp_path),
+            "no_agent": True,
+            "script": "probe.py",
+        }
 
-        monkeypatch.setattr(sched, "get_due_jobs", lambda: [workdir_a, workdir_b, parallel_job])
+        monkeypatch.setattr(
+            sched,
+            "get_due_jobs",
+            lambda: [workdir_a, workdir_b, parallel_job, script_job],
+        )
         monkeypatch.setattr(sched, "claim_job_for_fire", lambda *_a, **_kw: True)
 
         # Record call order / thread context.
@@ -175,7 +187,7 @@ class TestTickWorkdirPartition:
         )
 
         n = sched.tick(verbose=False)
-        assert n == 3
+        assert n == 4
 
         ids = [c[0] for c in calls]
         # Sequential workdir jobs preserve submission order relative to each
@@ -191,6 +203,8 @@ class TestTickWorkdirPartition:
             assert workdir_thread_name.startswith("cron-seq"), workdir_thread_name
         par_thread_name = next(t for j, t in calls if j == "c")
         assert par_thread_name.startswith("cron-parallel"), par_thread_name
+        script_thread_name = next(t for j, t in calls if j == "d")
+        assert script_thread_name.startswith("cron-no-agent"), script_thread_name
 
 
 # ---------------------------------------------------------------------------
