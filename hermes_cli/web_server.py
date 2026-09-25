@@ -383,6 +383,32 @@ def _eager_reconcile_own_session_db() -> None:
         )
 
 
+def _recover_interrupted_cron_executions() -> int:
+    """Reconcile dead manual-run owners across every dashboard profile."""
+    from cron.executions import recover_interrupted_executions
+    from cron import jobs as cron_jobs
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from hermes_cli.profiles import profiles_to_serve
+
+    recovered = 0
+    failures = []
+    for profile_name, home in profiles_to_serve(multiplex=True):
+        token = set_hermes_home_override(str(home))
+        try:
+            with cron_jobs.use_cron_store(home):
+                recovered += recover_interrupted_executions()
+        except Exception as exc:
+            failures.append(f"{profile_name}: {type(exc).__name__}")
+        finally:
+            reset_hermes_home_override(token)
+    if failures:
+        raise RuntimeError(
+            "cron execution recovery failed for profile(s): "
+            + ", ".join(failures)
+        )
+    return recovered
+
+
 @asynccontextmanager
 async def _lifespan(app: "FastAPI"):
     app.state.event_channels = {}  # dict[str, set]
@@ -429,6 +455,17 @@ async def _lifespan(app: "FastAPI"):
     from gateway.code_skew import record_boot_fingerprint
 
     record_boot_fingerprint()
+
+    # The dashboard has its own manual-trigger path and can run in a separate
+    # container from the gateway. Reconcile dead pre-start claims for every
+    # profile it can trigger before accepting another request.
+    try:
+        _recover_interrupted_cron_executions()
+    except Exception as exc:
+        _log.warning(
+            "startup cron execution recovery failed (%s); ambiguous claims "
+            "will remain protected until normal lease expiry", exc,
+        )
 
     # Desktop-spawned backends (HERMES_DESKTOP=1) fire cron jobs themselves,
     # since the app has no gateway running the scheduler. Server `hermes

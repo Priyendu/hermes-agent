@@ -131,7 +131,10 @@ class TestRunningJobGuard:
         result = callback()
         future.set_result(result)
 
-        assert claim_calls == [("queued-job", {"return_job": True})]
+        assert claim_calls == [(
+            "queued-job",
+            {"return_job": True, "execution_id": "execution-1"},
+        )]
         assert "queued-job" not in sched._running_job_ids
 
 

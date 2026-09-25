@@ -13,6 +13,7 @@ services:
   gateway:
     image: nousresearch/hermes-agent:latest
     container_name: hermes
+    hostname: hermes-gateway
     restart: unless-stopped
     volumes:
       - ${USERPROFILE}/.hermes:/opt/data
@@ -24,6 +25,7 @@ services:
   dashboard:
     image: nousresearch/hermes-agent:latest
     container_name: hermes-dashboard
+    hostname: hermes-dashboard
     restart: unless-stopped
     depends_on:
       - gateway

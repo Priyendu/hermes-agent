@@ -33,6 +33,8 @@ import cron.scheduler as scheduler_mod
 def executions(monkeypatch, tmp_path):
     import cron.executions as executions_mod
 
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("HERMES_MACHINE_ID", "test-stable-host")
     monkeypatch.setattr(
         executions_mod, "EXECUTIONS_FILE", tmp_path / "cron" / "executions.db"
     )
@@ -106,6 +108,244 @@ class TestTickReapsDeadOwnerClaims:
 
         assert executions.latest_execution("orphaned-running")["status"] == "unknown"
 
+    def test_recovery_clears_matching_not_started_fire_claim_and_allows_next_fire(
+        self, executions
+    ):
+        """A dead pre-start owner must not leave the next gateway behind the TTL."""
+        from cron.jobs import claim_job_for_fire, create_job, get_job
+
+        job = create_job(prompt="x", schedule="every 1m", name="restart-fire-claim")
+        record = executions.create_execution(job["id"], source="builtin")
+        claimed = claim_job_for_fire(
+            job["id"], return_job=True, execution_id=record["id"]
+        )
+        assert claimed["fire_claim"]["execution_id"] == record["id"]
+
+        with executions._transaction() as conn:
+            conn.execute(
+                "UPDATE executions SET process_id='dead-gateway', pid=?, "
+                "process_started_at=NULL WHERE id=?",
+                (_dead_pid(), record["id"]),
+            )
+
+        assert executions.recover_interrupted_executions() == 1
+        assert executions.latest_execution(job["id"])["status"] == "unknown"
+        assert get_job(job["id"])["fire_claim"] is None
+
+        retry_execution = executions.create_execution(job["id"], source="builtin")
+        retry_claim = claim_job_for_fire(
+            job["id"], return_job=True, execution_id=retry_execution["id"]
+        )
+        assert retry_claim["fire_claim"]["execution_id"] == retry_execution["id"]
+
+    def test_recovery_clears_execution_bound_oneshot_run_claim(self, executions):
+        """A dead pre-start one-shot must not wait out its full run-claim TTL."""
+        import cron.jobs as jobs
+
+        job = jobs.create_job(prompt="x", schedule="in 30m", name="orphaned-once")
+        record = executions.create_execution(job["id"], source="builtin")
+        records = jobs.load_jobs()
+        persisted = next(row for row in records if row["id"] == job["id"])
+        persisted["run_claim"] = {
+            "at": "2026-09-25T12:00:00+00:00",
+            "by": "one-shot-runner",
+        }
+        jobs.save_jobs(records)
+        assert jobs.link_run_claim_to_execution(
+            job["id"], execution_id=record["id"],
+            expected_owner="one-shot-runner",
+            expected_at="2026-09-25T12:00:00+00:00",
+        )
+        claimed = jobs.claim_job_for_fire(
+            job["id"], return_job=True, execution_id=record["id"]
+        )
+        assert claimed["fire_claim"]["execution_id"] == record["id"]
+
+        with executions._transaction() as conn:
+            conn.execute(
+                "UPDATE executions SET process_id='dead-gateway', pid=?, "
+                "process_started_at=NULL WHERE id=?",
+                (_dead_pid(), record["id"]),
+            )
+
+        assert executions.recover_interrupted_executions() == 1
+        recovered = jobs.get_job(job["id"])
+        assert recovered["fire_claim"] is None
+        assert recovered["run_claim"] is None
+
+    def test_recovery_clears_matching_legacy_claim_only_without_live_owner(
+        self, executions
+    ):
+        """Pre-upgrade claims can be correlated by time only absent any live row."""
+        from cron.jobs import claim_job_for_fire, create_job, get_job
+
+        job = create_job(prompt="x", schedule="every 1m", name="legacy-fire-claim")
+        record = executions.create_execution(job["id"], source="builtin")
+        assert claim_job_for_fire(job["id"], return_job=True)
+        assert "execution_id" not in get_job(job["id"])["fire_claim"]
+        with executions._transaction() as conn:
+            conn.execute(
+                "UPDATE executions SET process_id='dead-gateway', pid=?, "
+                "process_started_at=NULL WHERE id=?",
+                (_dead_pid(), record["id"]),
+            )
+
+        assert executions.recover_interrupted_executions() == 1
+        assert get_job(job["id"])["fire_claim"] is None
+
+    def test_recovery_preserves_fire_claim_for_started_dead_execution(
+        self, executions
+    ):
+        """Unknown side effects stay protected by the normal fire-claim TTL."""
+        from cron.jobs import claim_job_for_fire, create_job, get_job
+
+        job = create_job(prompt="x", schedule="every 1m", name="started-fire-claim")
+        record = executions.create_execution(job["id"], source="builtin")
+        executions.mark_execution_running(record["id"])
+        claimed = claim_job_for_fire(
+            job["id"], return_job=True, execution_id=record["id"]
+        )
+        claim_before = dict(claimed["fire_claim"])
+        with executions._transaction() as conn:
+            conn.execute(
+                "UPDATE executions SET process_id='dead-gateway', pid=?, "
+                "process_started_at=NULL WHERE id=?",
+                (_dead_pid(), record["id"]),
+            )
+
+        assert executions.recover_interrupted_executions() == 1
+        assert executions.latest_execution(job["id"])["status"] == "unknown"
+        assert get_job(job["id"])["fire_claim"] == claim_before
+
+    def test_recovery_never_treats_a_remote_execution_pid_as_dead(self, executions):
+        """A live remote owner is not disproved by a PID lookup on this host."""
+        from cron.jobs import claim_job_for_fire, create_job, get_job
+
+        job = create_job(prompt="x", schedule="every 1m", name="remote-fire-claim")
+        record = executions.create_execution(job["id"], source="external")
+        claimed = claim_job_for_fire(
+            job["id"], return_job=True, execution_id=record["id"]
+        )
+        claim_before = dict(claimed["fire_claim"])
+        with executions._transaction() as conn:
+            conn.execute(
+                "UPDATE executions SET owner_host_id='remote-host', "
+                "process_id='remote-process', pid=?, process_started_at=NULL "
+                "WHERE id=?",
+                (_dead_pid(), record["id"]),
+            )
+
+        assert executions.recover_interrupted_executions() == 0
+        assert executions.latest_execution(job["id"])["status"] == "claimed"
+        assert get_job(job["id"])["fire_claim"] == claim_before
+
+    def test_missing_owner_host_id_preserves_claim_even_when_pid_is_absent(
+        self, executions
+    ):
+        """Pre-migration rows have no proof that their PID is local."""
+        from cron.jobs import claim_job_for_fire, create_job, get_job
+
+        job = create_job(prompt="x", schedule="every 1m", name="unknown-host-claim")
+        record = executions.create_execution(job["id"], source="builtin")
+        claimed = claim_job_for_fire(
+            job["id"], return_job=True, execution_id=record["id"]
+        )
+        claim_before = dict(claimed["fire_claim"])
+        with executions._transaction() as conn:
+            conn.execute(
+                "UPDATE executions SET owner_host_id=NULL, process_id=?, pid=?, "
+                "process_started_at=NULL WHERE id=?",
+                ("legacy-owner", _dead_pid(), record["id"]),
+            )
+
+        assert executions.recover_interrupted_executions() == 0
+        assert executions.latest_execution(job["id"])["status"] == "claimed"
+        assert get_job(job["id"])["fire_claim"] == claim_before
+
+    def test_owner_host_id_requires_stable_configured_identity(
+        self, executions, monkeypatch
+    ):
+        monkeypatch.delenv("HERMES_MACHINE_ID")
+        monkeypatch.setattr(executions.socket, "gethostname", lambda: "0123456789ab")
+        assert executions._owner_host_id() is None
+
+        monkeypatch.setattr(executions.socket, "gethostname", lambda: "stable-host")
+        assert executions._owner_host_id() == "stable-host"
+
+        monkeypatch.setenv("HERMES_MACHINE_ID", "stable-host-across-restarts")
+        assert executions._owner_host_id() == "stable-host-across-restarts"
+
+    def test_owner_host_id_uses_config_only_for_ephemeral_hostname(
+        self, executions, monkeypatch
+    ):
+        monkeypatch.delenv("HERMES_MACHINE_ID", raising=False)
+        monkeypatch.setattr(executions.socket, "gethostname", lambda: "0123456789ab")
+        with patch(
+            "hermes_cli.config.load_config_readonly",
+            return_value={"cron": {"machine_id": "stable-config-host"}},
+        ):
+            assert executions._owner_host_id() == "stable-config-host"
+
+    def test_owner_host_id_prefers_service_hostname_over_shared_profile_config(
+        self, executions, monkeypatch
+    ):
+        monkeypatch.delenv("HERMES_MACHINE_ID", raising=False)
+        monkeypatch.setattr(executions.socket, "gethostname", lambda: "hermes-dashboard")
+        with patch(
+            "hermes_cli.config.load_config_readonly",
+            return_value={"cron": {"machine_id": "shared-profile-id"}},
+        ):
+            assert executions._owner_host_id() == "hermes-dashboard"
+
+    def test_recovery_does_not_clear_a_replacement_execution_claim(self, executions):
+        """A stale recovery candidate cannot revoke a newer claim by the same job."""
+        import cron.jobs as jobs
+
+        job = jobs.create_job(
+            prompt="x", schedule="every 1m", name="replacement-fire-claim"
+        )
+        record = executions.create_execution(job["id"], source="builtin")
+        claimed = jobs.claim_job_for_fire(
+            job["id"], return_job=True, execution_id=record["id"]
+        )
+        replacement = dict(claimed["fire_claim"])
+        replacement["execution_id"] = "newer-execution"
+        all_jobs = jobs.load_jobs()
+        all_jobs[0]["fire_claim"] = replacement
+        jobs.save_jobs(all_jobs)
+        with executions._transaction() as conn:
+            conn.execute(
+                "UPDATE executions SET process_id='dead-gateway', pid=?, "
+                "process_started_at=NULL WHERE id=?",
+                (_dead_pid(), record["id"]),
+            )
+
+        assert executions.recover_interrupted_executions() == 1
+        assert jobs.get_job(job["id"])["fire_claim"] == replacement
+
+    def test_legacy_recovery_preserves_claim_when_another_execution_is_live(
+        self, executions
+    ):
+        """A legacy claim is ambiguous if any live attempt now owns the job."""
+        from cron.jobs import claim_job_for_fire, create_job, get_job
+
+        job = create_job(prompt="x", schedule="every 1m", name="live-fire-claim")
+        interrupted = executions.create_execution(job["id"], source="builtin")
+        assert claim_job_for_fire(job["id"], return_job=True)
+        live = executions.create_execution(job["id"], source="builtin")
+        executions.mark_execution_running(live["id"])
+        with executions._transaction() as conn:
+            conn.execute(
+                "UPDATE executions SET process_id='dead-gateway', pid=?, "
+                "process_started_at=NULL WHERE id=?",
+                (_dead_pid(), interrupted["id"]),
+            )
+        claim_before = dict(get_job(job["id"])["fire_claim"])
+
+        assert executions.recover_interrupted_executions() == 1
+        assert executions.latest_execution(job["id"])["status"] == "running"
+        assert get_job(job["id"])["fire_claim"] == claim_before
+
     def test_live_owner_claim_is_never_rewritten(self, executions):
         """A claim owned by a live process (this one) must survive the reap."""
         record = executions.create_execution("live-job", source="builtin")
@@ -143,6 +383,74 @@ class TestTickReapsDeadOwnerClaims:
         )
 
         assert _run_tick() == 0
+
+    def test_lost_fire_claim_clears_only_its_linked_one_shot_claim(
+        self, executions, monkeypatch,
+    ):
+        """A scheduler loser must not strand its run_claim on the failed row."""
+        import cron.jobs as jobs
+
+        job = jobs.create_job(
+            prompt="x", schedule="in 30m", name="lost-fire-claim-oneshot",
+        )
+        snapshot = jobs.load_jobs()
+        record = next(row for row in snapshot if row["id"] == job["id"])
+        record["run_claim"] = {
+            "at": "2026-09-25T12:00:00+00:00",
+            "by": "scheduler-a",
+        }
+        jobs.save_jobs(snapshot)
+        due_job = jobs.get_job(job["id"])
+
+        monkeypatch.setattr(scheduler_mod, "get_due_jobs", lambda: [due_job])
+        monkeypatch.setattr(scheduler_mod, "advance_next_runs", lambda _ids: 0)
+        monkeypatch.setattr(scheduler_mod, "claim_job_for_fire", lambda *_a, **_k: False)
+
+        with (
+            patch.object(scheduler_mod, "run_one_job") as run,
+            patch("tools.mcp_tool._kill_orphaned_mcp_children", lambda: None),
+        ):
+            result = scheduler_mod.tick(verbose=False)
+
+        assert result == 1
+        execution = executions.latest_execution(job["id"])
+        assert execution["status"] == "failed"
+        assert execution["error"] == "Fire claim lost; execution was not started."
+        assert jobs.get_job(job["id"])["run_claim"] is None
+        run.assert_not_called()
+
+    def test_one_shot_binding_error_terminalizes_created_execution(
+        self, executions, monkeypatch,
+    ):
+        """A link I/O failure must not leave a live-owner claimed ledger row."""
+        import cron.jobs as jobs
+
+        job = jobs.create_job(
+            prompt="x", schedule="in 30m", name="binding-error-oneshot",
+        )
+        snapshot = jobs.load_jobs()
+        record = next(row for row in snapshot if row["id"] == job["id"])
+        record["run_claim"] = {
+            "at": "2026-09-25T12:00:00+00:00",
+            "by": "scheduler-a",
+        }
+        jobs.save_jobs(snapshot)
+        due_job = jobs.get_job(job["id"])
+
+        monkeypatch.setattr(scheduler_mod, "get_due_jobs", lambda: [due_job])
+        monkeypatch.setattr(scheduler_mod, "advance_next_runs", lambda _ids: 0)
+        def fail_link(*_args, **_kwargs):
+            raise OSError("jobs store unavailable")
+
+        monkeypatch.setattr(scheduler_mod, "link_run_claim_to_execution", fail_link)
+        with patch("tools.mcp_tool._kill_orphaned_mcp_children", lambda: None):
+            result = scheduler_mod.tick(verbose=False)
+
+        assert result == 0
+        execution = executions.latest_execution(job["id"])
+        assert execution["status"] == "failed"
+        assert "Scheduler execution setup failed before dispatch" in execution["error"]
+        assert jobs.get_job(job["id"])["run_claim"] is None
 
 
 class TestOneShotCliRunIsSynchronous:

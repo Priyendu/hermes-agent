@@ -16,6 +16,8 @@ import json
 import threading
 from unittest.mock import patch
 
+import pytest
+
 from tools.cronjob_tools import (
     _try_dispatch_background_run,
     cronjob,
@@ -24,6 +26,17 @@ from tools.cronjob_tools import (
 
 _JOB = {"id": "job-bg-1", "name": "bg run", "prompt": "hi",
         "schedule": {"kind": "cron", "expr": "0 9 * * *"}}
+
+
+@pytest.fixture(autouse=True)
+def _mock_manual_execution_ledger():
+    with patch("cron.executions.create_execution",
+               side_effect=lambda job_id, source: {
+                   "id": f"manual-exec-{job_id}",
+               }), \
+         patch("cron.executions.finish_execution"), \
+         patch("cron.executions.recover_interrupted_executions", return_value=0):
+        yield
 
 
 def _job(job_id):
@@ -79,7 +92,10 @@ class TestBackgroundDispatch:
             assert res["claimed"] is True
             assert res["dispatched"] is True
             assert res["delegation_id"]
-            m_claim.assert_called_once_with("job-bg-01", return_job=True)
+            m_claim.assert_called_once_with(
+                "job-bg-01", return_job=True,
+                execution_id="manual-exec-job-bg-01",
+            )
             # The job actually starts on the daemon executor.
             assert run_started.wait(timeout=5.0), "job never started in background"
         finally:
@@ -193,6 +209,9 @@ class TestSyncFallbacks:
         assert res["dispatched"] is False
         assert res["success"] is True
         m_run.assert_called_once()   # ran inline on this thread
+        inline_job = m_run.call_args.args[0]
+        assert inline_job["execution_id"] == "manual-exec-job-bg-07"
+        assert inline_job["fire_claim"]["by"] == "bg-owner"
 
 
 class TestInFlightDedupe:
@@ -304,5 +323,8 @@ class TestCronjobRunToolIntegration:
         assert out["success"] is True
         assert out["job"]["executed"] is True
         assert out["job"]["execution_success"] is True
-        m_claim.assert_called_once_with("job-bg-13", return_job=True)
+        m_claim.assert_called_once_with(
+            "job-bg-13", return_job=True,
+            execution_id="manual-exec-job-bg-13",
+        )
         m_run.assert_called_once()

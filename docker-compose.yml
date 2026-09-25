@@ -31,6 +31,7 @@ services:
     build: .
     image: hermes-agent
     container_name: hermes
+    hostname: hermes-gateway
     restart: unless-stopped
     network_mode: host
     volumes:
@@ -63,6 +64,7 @@ services:
   dashboard:
     image: hermes-agent
     container_name: hermes-dashboard
+    hostname: hermes-dashboard
     restart: unless-stopped
     network_mode: host
     depends_on:

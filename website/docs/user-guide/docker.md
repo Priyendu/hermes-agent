@@ -384,6 +384,18 @@ services:
 
 Start with `docker compose up -d` and view logs with `docker compose logs -f`. The supervised gateway's stdout is also tee'd to `${HERMES_HOME}/logs/gateways/<profile>/current` on the volume — see [Where the logs go](#where-the-logs-go) for the full routing map.
 
+The supplied Compose files assign stable `hermes-gateway` and
+`hermes-dashboard` hostnames so durable scheduled-job claims can be attributed
+across container recreation and the two PID namespaces stay distinct. Custom
+Compose deployments with separate claim-owning containers sharing one Hermes
+home must likewise give each service a distinct stable hostname. On a
+single-machine deployment whose hostname is ephemeral, configure
+`cron.machine_id` in that profile's `config.yaml` as a stable fallback; a
+stable service hostname takes precedence over this profile-level value. Never
+reuse an identity across concurrently active PID namespaces sharing an
+execution ledger. Without a stable identity, ambiguous execution rows are
+preserved rather than reaped using an unverified PID.
+
 ## Optional: Linux desktop audio bridge
 
 Voice mode in Docker needs two separate things to work: Hermes must be allowed to probe audio devices inside the container, and the container must be able to reach your host audio server. The setup below covers the host audio plumbing for Linux desktops that expose a PulseAudio-compatible socket, including many PipeWire setups.

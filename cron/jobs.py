@@ -3343,6 +3343,92 @@ def clear_run_claim(job_id: str) -> bool:
     return False
 
 
+def clear_run_claim_for_execution(job_id: str, *, execution_id: str) -> bool:
+    """Clear only the one-shot run claim still linked to ``execution_id``.
+
+    A scheduler attempt may lose its durable fire-claim CAS after linking a
+    one-shot claim. Its execution never starts, so release that exact run claim
+    without clearing a replacement installed by another dispatcher.
+    """
+    expected_execution_id = str(execution_id or "")
+    if not expected_execution_id:
+        return False
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if str(job.get("id")) != str(job_id):
+                continue
+            if job.get("schedule", {}).get("kind") != "once":
+                return False
+            claim = job.get("run_claim")
+            if (not isinstance(claim, dict)
+                    or str(claim.get("execution_id") or "")
+                    != expected_execution_id):
+                return False
+            job["run_claim"] = None
+            save_jobs(jobs)
+            return True
+    return False
+
+
+def clear_run_claim_if_matches(
+    job_id: str, *, expected_owner: str, expected_at: str,
+    expected_execution_id: Optional[str] = None,
+) -> bool:
+    """Clear a one-shot claim only if its full observed identity still matches."""
+    if not expected_owner or not expected_at:
+        return False
+    expected_id = str(expected_execution_id or "")
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if str(job.get("id")) != str(job_id):
+                continue
+            if job.get("schedule", {}).get("kind") != "once":
+                return False
+            claim = job.get("run_claim")
+            if (not isinstance(claim, dict)
+                    or claim.get("by") != expected_owner
+                    or claim.get("at") != expected_at
+                    or str(claim.get("execution_id") or "") != expected_id):
+                return False
+            job["run_claim"] = None
+            save_jobs(jobs)
+            return True
+    return False
+
+
+def link_run_claim_to_execution(
+    job_id: str, *, execution_id: str, expected_owner: str, expected_at: str,
+) -> bool:
+    """Bind a due one-shot's run claim to its newly-created execution.
+
+    Exact owner/timestamp comparison fences a later due claim that replaced
+    this one between ``get_due_jobs`` and execution creation. Existing links
+    are idempotent only for the same execution ID.
+    """
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if str(job.get("id")) != str(job_id):
+                continue
+            if job.get("schedule", {}).get("kind") != "once":
+                return False
+            claim = job.get("run_claim")
+            if (not isinstance(claim, dict)
+                    or claim.get("by") != expected_owner
+                    or claim.get("at") != expected_at):
+                return False
+            current_execution_id = claim.get("execution_id")
+            if (current_execution_id is not None
+                    and str(current_execution_id) != str(execution_id)):
+                return False
+            claim["execution_id"] = str(execution_id)
+            save_jobs(jobs)
+            return True
+    return False
+
+
 def advance_next_runs(job_ids) -> int:
     """Batch form of :func:`advance_next_run` for the due-dispatch loop.
 
@@ -3402,12 +3488,33 @@ def advance_next_run(job_id: str) -> bool:
 def _machine_id() -> str:
     """Stable-ish identifier for claim attribution/debugging (NOT correctness).
 
-    Uses ``HERMES_MACHINE_ID`` if set, else hostname + pid. The CAS correctness
-    comes from the file lock + the fresh-claim check, not from this value.
+    Uses the internal service identity, then a stable hostname, then
+    configured ``cron.machine_id`` for otherwise ephemeral hosts. CAS
+    correctness comes from the file lock and fresh-claim check, not from this
+    value.
     """
     explicit = os.getenv("HERMES_MACHINE_ID", "").strip()
     if explicit:
         return explicit
+    try:
+        import socket
+
+        host = socket.gethostname().strip()
+        if host and not (12 <= len(host) <= 64
+                         and all(char in "0123456789abcdefABCDEF"
+                                 for char in host)):
+            return host
+    except Exception:
+        pass
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cron_config = (load_config_readonly() or {}).get("cron") or {}
+        configured = cron_config.get("machine_id", "")
+        if isinstance(configured, str) and configured.strip():
+            return configured.strip()
+    except Exception:
+        pass
     try:
         import socket
         host = socket.gethostname()
@@ -3422,7 +3529,9 @@ def claim_job_for_fire(
     claim_ttl_seconds: int = 300,
     force: bool = False,
     return_job: bool = False,
+    execution_id: Optional[str] = None,
 ) -> Union[bool, Dict[str, Any]]:
+    """Acquire the durable fire lease, optionally linked to its execution row."""
     with _fire_job_lock(job_id) as acquired:
         if not acquired:
             return False
@@ -3431,6 +3540,7 @@ def claim_job_for_fire(
             claim_ttl_seconds=claim_ttl_seconds,
             force=force,
             return_job=return_job,
+            execution_id=execution_id,
         )
 
 
@@ -3440,6 +3550,7 @@ def _claim_job_for_fire_locked(
     claim_ttl_seconds: int = 300,
     force: bool = False,
     return_job: bool = False,
+    execution_id: Optional[str] = None,
 ) -> Union[bool, Dict[str, Any]]:
     """Atomically claim a job for a single external 'fire' (multi-machine
     at-most-once). Returns True iff THIS caller won the claim.
@@ -3458,7 +3569,8 @@ def _claim_job_for_fire_locked(
     re-delivery for the old time can't re-fire). One-shots keep ``next_run_at``
     but the fresh ``fire_claim`` blocks a duplicate retry for the same fire.
     ``mark_job_run`` clears the claim on completion so a re-armed recurring job
-    is claimable again next fire.
+    is claimable again next fire. Runtime callers pass ``execution_id`` so
+    dead-owner recovery can compare-and-clear only the lease for that attempt.
 
     The stale-claim TTL means a machine that crashed after claiming but before
     completing doesn't wedge the job forever — after the TTL another fire can
@@ -3503,6 +3615,8 @@ def _claim_job_for_fire_locked(
             # claim merely because hostname + PID are unchanged.
             owner = f"{_machine_id()}:{uuid.uuid4().hex}"
             job["fire_claim"] = {"at": now.isoformat(), "by": owner}
+            if execution_id:
+                job["fire_claim"]["execution_id"] = str(execution_id)
             kind = job.get("schedule", {}).get("kind")
             if kind in {"cron", "interval"}:
                 nxt = compute_next_run(job["schedule"], now.isoformat())
@@ -3629,6 +3743,114 @@ def _heartbeat_fire_claim_locked(job_id: str, *, expected_owner: str) -> bool:
             claim["at"] = _hermes_now().isoformat()
             save_jobs(jobs)
             return True
+    return False
+
+
+def clear_recovered_fire_claim(
+    job_id: str,
+    *,
+    execution_id: str,
+    owner_host_id: Optional[str],
+    execution_claimed_at: str,
+    recovery_finished_at: str,
+) -> bool:
+    """Clear only claims belonging to a dead, not-started execution.
+
+    New fire and one-shot run claims carry their execution id, making recovery
+    an exact compare-and-clear. Older fire claims have no execution id; for
+    those, require the claim timestamp to fall inside the recovered execution's
+    lifetime and recheck that no active execution now owns the job. Legacy
+    one-shot run claims without an execution id remain until their TTL.
+    """
+    from datetime import datetime
+    from cron.executions import _owner_host_id, has_active_execution
+
+    # The execution reaper can prove process death only on its own host. A
+    # missing host identity is an old/ambiguous record, so preserve its lease.
+    if not owner_host_id or owner_host_id != _owner_host_id():
+        return False
+
+    with _fire_job_lock(job_id) as acquired:
+        if not acquired:
+            return False
+        with _jobs_lock():
+            jobs = load_jobs()
+            for job in jobs:
+                if str(job.get("id")) != str(job_id):
+                    continue
+                changed = False
+                fire_claim = job.get("fire_claim")
+                if isinstance(fire_claim, dict):
+                    claim_execution_id = fire_claim.get("execution_id")
+                    if claim_execution_id is not None:
+                        if str(claim_execution_id) == str(execution_id):
+                            job["fire_claim"] = None
+                            changed = True
+                    else:
+                        # Legacy leases cannot be matched by ID. Only clear
+                        # when their timestamp is in this execution window
+                        # and no live execution remains.
+                        try:
+                            claim_at = _ensure_aware(
+                                datetime.fromisoformat(fire_claim["at"])
+                            )
+                            started_at = _ensure_aware(
+                                datetime.fromisoformat(execution_claimed_at)
+                            )
+                            recovered_at = _ensure_aware(
+                                datetime.fromisoformat(recovery_finished_at)
+                            )
+                        except (KeyError, TypeError, ValueError):
+                            claim_at = started_at = recovered_at = None
+                        if (claim_at is not None
+                                and started_at is not None
+                                and recovered_at is not None
+                                and started_at <= claim_at <= recovered_at
+                                and not has_active_execution(job_id)):
+                            job["fire_claim"] = None
+                            changed = True
+
+                run_claim = job.get("run_claim")
+                if (job.get("schedule", {}).get("kind") == "once"
+                        and isinstance(run_claim, dict)
+                        and str(run_claim.get("execution_id") or "")
+                        == str(execution_id)):
+                    job["run_claim"] = None
+                    changed = True
+
+                if not changed:
+                    return False
+                save_jobs(jobs)
+                return True
+    return False
+
+
+def release_unstarted_manual_fire_claim(
+    job_id: str, *, execution_id: str, expected_owner: str,
+) -> bool:
+    """Release a manual fire lease only when its linked run never started.
+
+    This is used when process-local running-set registration loses after the
+    manual path has already acquired its durable lease. Both the execution id
+    and exact fire owner fence against clearing a replacement claim.
+    """
+    with _fire_job_lock(job_id) as acquired:
+        if not acquired:
+            return False
+        with _jobs_lock():
+            jobs = load_jobs()
+            for job in jobs:
+                if str(job.get("id")) != str(job_id):
+                    continue
+                claim = job.get("fire_claim")
+                if (not isinstance(claim, dict)
+                        or claim.get("by") != expected_owner
+                        or str(claim.get("execution_id") or "")
+                        != str(execution_id)):
+                    return False
+                job["fire_claim"] = None
+                save_jobs(jobs)
+                return True
     return False
 
 
