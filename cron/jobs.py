@@ -3402,9 +3402,19 @@ def advance_next_run(job_id: str) -> bool:
 def _machine_id() -> str:
     """Stable-ish identifier for claim attribution/debugging (NOT correctness).
 
-    Uses ``HERMES_MACHINE_ID`` if set, else hostname + pid. The CAS correctness
-    comes from the file lock + the fresh-claim check, not from this value.
+    Uses configured ``cron.machine_id``, then the internal environment
+    bridge, else hostname + pid. CAS correctness comes from the file lock and
+    fresh-claim check, not from this value.
     """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cron_config = (load_config_readonly() or {}).get("cron") or {}
+        configured = cron_config.get("machine_id", "")
+        if isinstance(configured, str) and configured.strip():
+            return configured.strip()
+    except Exception:
+        pass
     explicit = os.getenv("HERMES_MACHINE_ID", "").strip()
     if explicit:
         return explicit
@@ -3702,6 +3712,35 @@ def clear_recovered_fire_claim(
                     if has_active_execution(job_id):
                         return False
 
+                job["fire_claim"] = None
+                save_jobs(jobs)
+                return True
+    return False
+
+
+def release_unstarted_manual_fire_claim(
+    job_id: str, *, execution_id: str, expected_owner: str,
+) -> bool:
+    """Release a manual fire lease only when its linked run never started.
+
+    This is used when process-local running-set registration loses after the
+    manual path has already acquired its durable lease. Both the execution id
+    and exact fire owner fence against clearing a replacement claim.
+    """
+    with _fire_job_lock(job_id) as acquired:
+        if not acquired:
+            return False
+        with _jobs_lock():
+            jobs = load_jobs()
+            for job in jobs:
+                if str(job.get("id")) != str(job_id):
+                    continue
+                claim = job.get("fire_claim")
+                if (not isinstance(claim, dict)
+                        or claim.get("by") != expected_owner
+                        or str(claim.get("execution_id") or "")
+                        != str(execution_id)):
+                    return False
                 job["fire_claim"] = None
                 save_jobs(jobs)
                 return True

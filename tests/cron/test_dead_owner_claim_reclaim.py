@@ -240,6 +240,15 @@ class TestTickReapsDeadOwnerClaims:
         monkeypatch.setenv("HERMES_MACHINE_ID", "stable-host-across-restarts")
         assert executions._owner_host_id() == "stable-host-across-restarts"
 
+    def test_owner_host_id_prefers_configured_machine_id(self, executions, monkeypatch):
+        monkeypatch.delenv("HERMES_MACHINE_ID", raising=False)
+        monkeypatch.setattr(executions.socket, "gethostname", lambda: "ephemeral")
+        with patch(
+            "hermes_cli.config.load_config_readonly",
+            return_value={"cron": {"machine_id": "stable-config-host"}},
+        ):
+            assert executions._owner_host_id() == "stable-config-host"
+
     def test_recovery_does_not_clear_a_replacement_execution_claim(self, executions):
         """A stale recovery candidate cannot revoke a newer claim by the same job."""
         import cron.jobs as jobs

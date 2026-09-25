@@ -13,20 +13,19 @@ services:
   gateway:
     image: nousresearch/hermes-agent:latest
     container_name: hermes
+    hostname: hermes-gateway
     restart: unless-stopped
     volumes:
       - ${USERPROFILE}/.hermes:/opt/data
     environment:
       - HERMES_UID=10000
       - HERMES_GID=10000
-      # Stable across container recreation so dead pre-start claims can be
-      # proven local. Override uniquely per gateway when replicas share state.
-      - HERMES_MACHINE_ID=${HERMES_MACHINE_ID:-hermes-gateway}
     command: ["gateway", "run"]
 
   dashboard:
     image: nousresearch/hermes-agent:latest
     container_name: hermes-dashboard
+    hostname: hermes-dashboard
     restart: unless-stopped
     depends_on:
       - gateway
@@ -35,7 +34,6 @@ services:
     environment:
       - HERMES_UID=10000
       - HERMES_GID=10000
-      - HERMES_MACHINE_ID=${HERMES_DASHBOARD_MACHINE_ID:-hermes-dashboard}
       - HERMES_DASHBOARD_HOST=0.0.0.0
     ports:
       - "127.0.0.1:9119:9119"

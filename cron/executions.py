@@ -40,6 +40,20 @@ def _owner_host_id() -> Optional[str]:
     Docker-generated hex container ID is not; without a stable identity the
     owner is indeterminate and is preserved.
     """
+    # Behavioral configuration belongs in config.yaml. The environment value
+    # is retained only as an internal bridge for managed runtimes/tests.
+    configured = ""
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cron_config = (load_config_readonly() or {}).get("cron") or {}
+        value = cron_config.get("machine_id", "")
+        if isinstance(value, str):
+            configured = value.strip()
+    except Exception:
+        pass
+    if configured:
+        return configured
     configured = os.getenv("HERMES_MACHINE_ID", "").strip()
     if configured:
         return configured

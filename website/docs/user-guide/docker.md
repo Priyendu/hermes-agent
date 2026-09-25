@@ -384,16 +384,13 @@ services:
 
 Start with `docker compose up -d` and view logs with `docker compose logs -f`. The supervised gateway's stdout is also tee'd to `${HERMES_HOME}/logs/gateways/<profile>/current` on the volume — see [Where the logs go](#where-the-logs-go) for the full routing map.
 
-The supplied Compose files set `HERMES_MACHINE_ID` to a stable single-gateway
-identity so durable scheduled-job claims can be attributed safely across
-container recreation. If multiple claim-owning services or gateway replicas
-share one Hermes home and cron store, give each a different stable identity;
-never reuse an identity across concurrently active replicas. The Windows
-Compose dashboard uses `HERMES_DASHBOARD_MACHINE_ID` (default
-`hermes-dashboard`) separately from the gateway. Non-Docker installs may use a
-stable host hostname when this variable is unset. Docker-generated ephemeral
-hostnames are treated as unknown, so ambiguous execution rows are preserved
-rather than reaped using an unverified PID.
+The supplied Compose files assign stable `hermes-gateway` and
+`hermes-dashboard` hostnames so durable scheduled-job claims can be attributed
+across container recreation. For other deployments whose hostnames are not
+stable, configure a unique `cron.machine_id` in that profile's `config.yaml`.
+Never reuse an identity across concurrently active machines sharing an
+execution ledger. Without a stable identity, ambiguous execution rows are
+preserved rather than reaped using an unverified PID.
 
 ## Optional: Linux desktop audio bridge
 

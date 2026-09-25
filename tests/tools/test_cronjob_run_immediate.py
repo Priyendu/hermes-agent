@@ -37,6 +37,31 @@ def _mock_manual_execution_ledger():
 
 
 class TestCronjobRunExecutesImmediately:
+    def test_lost_running_registration_finishes_execution_and_releases_exact_claim(self):
+        from tools.cronjob_tools import _run_claimed_job
+
+        claimed = {
+            **_JOB,
+            "execution_id": "manual-exec",
+            "fire_claim": {"by": "manual-owner", "execution_id": "manual-exec"},
+        }
+        with patch("cron.scheduler.try_register_running_job", return_value=False), \
+             patch("cron.scheduler.run_one_job") as run_job, \
+             patch("cron.executions.finish_execution") as finish, \
+             patch("cron.jobs.release_unstarted_manual_fire_claim", return_value=True) as release:
+            result = _run_claimed_job(claimed)
+
+        assert result["claimed"] is True
+        assert result["success"] is False
+        assert "already running" in result["error"]
+        run_job.assert_not_called()
+        finish.assert_called_once_with(
+            "manual-exec", success=False, error=result["error"],
+        )
+        release.assert_called_once_with(
+            "job-run-1", execution_id="manual-exec", expected_owner="manual-owner",
+        )
+
     def test_manual_claim_creates_execution_and_links_before_claim(self):
         from tools.cronjob_tools import _claim_manual_execution
 

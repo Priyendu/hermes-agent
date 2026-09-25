@@ -384,10 +384,29 @@ def _eager_reconcile_own_session_db() -> None:
 
 
 def _recover_interrupted_cron_executions() -> int:
-    """Reconcile dead manual-run owners for this claim-owning server process."""
+    """Reconcile dead manual-run owners across every dashboard profile."""
     from cron.executions import recover_interrupted_executions
+    from cron import jobs as cron_jobs
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from hermes_cli.profiles import profiles_to_serve
 
-    return recover_interrupted_executions()
+    recovered = 0
+    failures = []
+    for profile_name, home in profiles_to_serve(multiplex=True):
+        token = set_hermes_home_override(str(home))
+        try:
+            with cron_jobs.use_cron_store(home):
+                recovered += recover_interrupted_executions()
+        except Exception as exc:
+            failures.append(f"{profile_name}: {type(exc).__name__}")
+        finally:
+            reset_hermes_home_override(token)
+    if failures:
+        raise RuntimeError(
+            "cron execution recovery failed for profile(s): "
+            + ", ".join(failures)
+        )
+    return recovered
 
 
 @asynccontextmanager
@@ -437,11 +456,9 @@ async def _lifespan(app: "FastAPI"):
 
     record_boot_fingerprint()
 
-    # The dashboard has its own manual-trigger path and, in Docker Desktop,
-    # can run in a separate container from the gateway. Reconcile its own
-    # dead pre-start claims before accepting another trigger. A stable,
-    # per-service HERMES_MACHINE_ID lets the gateway and dashboard distinguish
-    # one another without probing a remote PID namespace.
+    # The dashboard has its own manual-trigger path and can run in a separate
+    # container from the gateway. Reconcile dead pre-start claims for every
+    # profile it can trigger before accepting another request.
     try:
         _recover_interrupted_cron_executions()
     except Exception as exc:

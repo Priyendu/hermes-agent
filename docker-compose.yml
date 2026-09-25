@@ -31,6 +31,7 @@ services:
     build: .
     image: hermes-agent
     container_name: hermes
+    hostname: hermes-gateway
     restart: unless-stopped
     network_mode: host
     volumes:
@@ -38,9 +39,6 @@ services:
     environment:
       - HERMES_UID=${HERMES_UID:-10000}
       - HERMES_GID=${HERMES_GID:-10000}
-      # Stable across container recreation so dead pre-start claims can be
-      # proven local. Override uniquely per gateway when replicas share state.
-      - HERMES_MACHINE_ID=${HERMES_MACHINE_ID:-hermes-gateway}
       # To expose the OpenAI-compatible API server beyond localhost,
       # uncomment BOTH lines (API_SERVER_KEY is mandatory for auth):
       # - API_SERVER_HOST=0.0.0.0
@@ -66,6 +64,7 @@ services:
   dashboard:
     image: hermes-agent
     container_name: hermes-dashboard
+    hostname: hermes-dashboard
     restart: unless-stopped
     network_mode: host
     depends_on:

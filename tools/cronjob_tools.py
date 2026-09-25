@@ -996,19 +996,20 @@ def _run_claimed_job(
         # running set — the same guard _submit_with_guard uses — which also
         # makes this run visible to the gateway shutdown drain
         # (get_running_job_ids, #60432) and mark_running_jobs_interrupted.
+        claim = job.get("fire_claim")
+        fire_owner = str(claim.get("by") or "") if isinstance(claim, dict) else None
         if not try_register_running_job(job_id):
+            error = (
+                "Job is already running (a scheduler tick or another manual "
+                "run is executing it); not started again."
+            )
+            _finalize_unstarted_manual_claim(job, error)
             return {
                 "claimed": True,
                 "success": False,
-                "error": (
-                    "Job is already running (a scheduler tick or another "
-                    "manual run is executing it); not started again."
-                ),
+                "error": error,
             }
         _registered = True
-
-        claim = job.get("fire_claim")
-        fire_owner = str(claim.get("by") or "") if isinstance(claim, dict) else None
 
         # run_one_job records last_run_at/last_status via mark_job_run (which
         # also clears the fire claim) and returns True iff it processed the job.
@@ -1162,6 +1163,27 @@ def _claim_manual_execution(job_id: str):
         )
         return claimed
     return {**claimed, "execution_id": execution_id}
+
+
+def _finalize_unstarted_manual_claim(job: Dict[str, Any], error: str) -> None:
+    """Terminalize an unstarted manual attempt and release only its own lease."""
+    execution_id = job.get("execution_id")
+    claim = job.get("fire_claim")
+    owner = claim.get("by") if isinstance(claim, dict) else None
+    if not execution_id or not isinstance(owner, str) or not owner:
+        return
+    from cron.executions import finish_execution
+    from cron.jobs import release_unstarted_manual_fire_claim
+
+    finish_execution(str(execution_id), success=False, error=error)
+    if not release_unstarted_manual_fire_claim(
+            str(job["id"]), execution_id=str(execution_id),
+            expected_owner=owner):
+        logger.warning(
+            "Could not release unstarted manual fire claim for job %s; "
+            "claim owner or execution id changed",
+            job["id"],
+        )
 
 
 def _latest_job_output_excerpt(job_id: str, max_chars: int = 2000) -> Optional[str]:

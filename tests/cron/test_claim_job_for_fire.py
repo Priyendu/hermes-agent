@@ -9,6 +9,7 @@ E2E-over-mocks discipline for file-touching code.
 """
 import threading
 import time
+from unittest.mock import patch
 
 import pytest
 
@@ -175,6 +176,40 @@ def test_stale_fire_owner_cannot_mark_replacement_run(temp_home):
     persisted = jobs.get_job(job["id"])
     assert persisted["fire_claim"]["by"] == "replacement"
     assert persisted.get("last_run_at") is None
+
+
+def test_unstarted_manual_release_requires_exact_execution_and_owner(temp_home):
+    import cron.jobs as jobs
+
+    job = jobs.create_job(prompt="x", schedule="every 5m", name="manual-release")
+    claimed = jobs.claim_job_for_fire(
+        job["id"], return_job=True, execution_id="exec-1",
+    )
+    claim = dict(claimed["fire_claim"])
+
+    assert not jobs.release_unstarted_manual_fire_claim(
+        job["id"], execution_id="replacement-exec", expected_owner=claim["by"],
+    )
+    assert not jobs.release_unstarted_manual_fire_claim(
+        job["id"], execution_id="exec-1", expected_owner="replacement-owner",
+    )
+    assert jobs.get_job(job["id"])["fire_claim"] == claim
+
+    assert jobs.release_unstarted_manual_fire_claim(
+        job["id"], execution_id="exec-1", expected_owner=claim["by"],
+    )
+    assert jobs.get_job(job["id"])["fire_claim"] is None
+
+
+def test_claim_attribution_uses_configured_machine_id(monkeypatch):
+    import cron.jobs as jobs
+
+    monkeypatch.delenv("HERMES_MACHINE_ID", raising=False)
+    with patch(
+        "hermes_cli.config.load_config_readonly",
+        return_value={"cron": {"machine_id": "stable-config-host"}},
+    ):
+        assert jobs._machine_id() == "stable-config-host"
 
 
 def test_fire_claim_fence_serializes_terminal_revocation(temp_home):

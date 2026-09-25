@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import time
 import threading
+from contextlib import nullcontext
 from unittest.mock import patch
 
 import pytest
@@ -93,6 +94,30 @@ def test_lifespan_recovers_this_servers_interrupted_cron_executions():
     ) as recover:
         with TestClient(web_server_mod.app, raise_server_exceptions=False):
             recover.assert_called_once_with()
+
+
+def test_cron_recovery_visits_every_dashboard_profile(tmp_path):
+    """Every profile triggerable through the dashboard gets its own ledger recovery."""
+    from pathlib import Path
+
+    homes = [tmp_path / "default", tmp_path / "swing"]
+    calls = []
+    with patch(
+        "hermes_cli.profiles.profiles_to_serve",
+        return_value=[("default", homes[0]), ("swing", homes[1])],
+    ), patch(
+        "cron.jobs.use_cron_store",
+        side_effect=lambda home: (calls.append(("store", Path(home))) or nullcontext()),
+    ), patch(
+        "cron.executions.recover_interrupted_executions",
+        side_effect=lambda: calls.append(("recover", None)) or 1,
+    ):
+        assert web_server_mod._recover_interrupted_cron_executions() == 2
+
+    assert calls == [
+        ("store", homes[0]), ("recover", None),
+        ("store", homes[1]), ("recover", None),
+    ]
 
 
 # ---------------------------------------------------------------------------
