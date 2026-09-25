@@ -386,12 +386,14 @@ Start with `docker compose up -d` and view logs with `docker compose logs -f`. T
 
 The supplied Compose files set `HERMES_MACHINE_ID` to a stable single-gateway
 identity so durable scheduled-job claims can be attributed safely across
-container recreation. If multiple gateway replicas share one Hermes home and
-cron store, give each a different stable identity; never reuse an identity
-across concurrently active replicas. Non-Docker installs may use a stable host
-hostname when this variable is unset. Docker-generated ephemeral hostnames are
-treated as unknown, so ambiguous execution rows are preserved rather than
-reaped using an unverified PID.
+container recreation. If multiple claim-owning services or gateway replicas
+share one Hermes home and cron store, give each a different stable identity;
+never reuse an identity across concurrently active replicas. The Windows
+Compose dashboard uses `HERMES_DASHBOARD_MACHINE_ID` (default
+`hermes-dashboard`) separately from the gateway. Non-Docker installs may use a
+stable host hostname when this variable is unset. Docker-generated ephemeral
+hostnames are treated as unknown, so ambiguous execution rows are preserved
+rather than reaped using an unverified PID.
 
 ## Optional: Linux desktop audio bridge
 

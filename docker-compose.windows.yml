@@ -35,6 +35,7 @@ services:
     environment:
       - HERMES_UID=10000
       - HERMES_GID=10000
+      - HERMES_MACHINE_ID=${HERMES_DASHBOARD_MACHINE_ID:-hermes-dashboard}
       - HERMES_DASHBOARD_HOST=0.0.0.0
     ports:
       - "127.0.0.1:9119:9119"

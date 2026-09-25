@@ -84,6 +84,17 @@ def test_lifespan_warmup_is_synchronous():
     )
 
 
+def test_lifespan_recovers_this_servers_interrupted_cron_executions():
+    """The dashboard owns manual trigger leases and must reap at startup."""
+    from fastapi.testclient import TestClient
+
+    with patch.object(
+        web_server_mod, "_recover_interrupted_cron_executions",
+    ) as recover:
+        with TestClient(web_server_mod.app, raise_server_exceptions=False):
+            recover.assert_called_once_with()
+
+
 # ---------------------------------------------------------------------------
 # Test 2 — get_status run_in_executor keeps event loop free for other requests
 # ---------------------------------------------------------------------------

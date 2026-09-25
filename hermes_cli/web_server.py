@@ -383,6 +383,13 @@ def _eager_reconcile_own_session_db() -> None:
         )
 
 
+def _recover_interrupted_cron_executions() -> int:
+    """Reconcile dead manual-run owners for this claim-owning server process."""
+    from cron.executions import recover_interrupted_executions
+
+    return recover_interrupted_executions()
+
+
 @asynccontextmanager
 async def _lifespan(app: "FastAPI"):
     app.state.event_channels = {}  # dict[str, set]
@@ -429,6 +436,19 @@ async def _lifespan(app: "FastAPI"):
     from gateway.code_skew import record_boot_fingerprint
 
     record_boot_fingerprint()
+
+    # The dashboard has its own manual-trigger path and, in Docker Desktop,
+    # can run in a separate container from the gateway. Reconcile its own
+    # dead pre-start claims before accepting another trigger. A stable,
+    # per-service HERMES_MACHINE_ID lets the gateway and dashboard distinguish
+    # one another without probing a remote PID namespace.
+    try:
+        _recover_interrupted_cron_executions()
+    except Exception as exc:
+        _log.warning(
+            "startup cron execution recovery failed (%s); ambiguous claims "
+            "will remain protected until normal lease expiry", exc,
+        )
 
     # Desktop-spawned backends (HERMES_DESKTOP=1) fire cron jobs themselves,
     # since the app has no gateway running the scheduler. Server `hermes

@@ -17,6 +17,8 @@ import time
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from tools.cronjob_tools import cronjob, _execute_job_now
 from tools.environments.base import set_activity_callback
 
@@ -25,11 +27,62 @@ _JOB = {"id": "job-run-1", "name": "manual run", "prompt": "hi",
         "schedule": {"kind": "cron", "expr": "0 9 * * *"}}
 
 
+@pytest.fixture(autouse=True)
+def _mock_manual_execution_ledger():
+    with patch("cron.executions.create_execution",
+               return_value={"id": "manual-exec"}), \
+         patch("cron.executions.finish_execution"), \
+         patch("cron.executions.recover_interrupted_executions", return_value=0):
+        yield
+
+
 class TestCronjobRunExecutesImmediately:
+    def test_manual_claim_creates_execution_and_links_before_claim(self):
+        from tools.cronjob_tools import _claim_manual_execution
+
+        order = []
+        claimed = {**_JOB, "fire_claim": {"by": "manual-owner"}}
+        with patch("cron.executions.create_execution",
+                   side_effect=lambda job_id, source: (
+                       order.append(("execution", job_id, source))
+                       or {"id": "manual-exec"}
+                   )), \
+             patch("tools.cronjob_tools.claim_job_for_fire",
+                   side_effect=lambda job_id, **kwargs: (
+                       order.append(("claim", job_id, kwargs["execution_id"]))
+                       or claimed
+                   )) as m_claim:
+            result = _claim_manual_execution("job-run-1")
+
+        assert order == [
+            ("execution", "job-run-1", "manual"),
+            ("claim", "job-run-1", "manual-exec"),
+        ]
+        assert result["execution_id"] == "manual-exec"
+        m_claim.assert_called_once_with(
+            "job-run-1", return_job=True, execution_id="manual-exec",
+        )
+
+    def test_manual_claim_without_lease_terminates_unused_execution(self):
+        from tools.cronjob_tools import _claim_manual_execution
+
+        with patch("cron.executions.create_execution",
+                   return_value={"id": "manual-exec"}), \
+             patch("cron.executions.finish_execution") as finish, \
+             patch("tools.cronjob_tools.claim_job_for_fire", return_value=False):
+            result = _claim_manual_execution("job-run-1")
+
+        assert result is False
+        finish.assert_called_once_with(
+            "manual-exec", success=False,
+            error="manual fire claim not acquired",
+        )
+
     def test_run_action_claims_and_fires_via_run_one_job(self):
         """action='run' must claim the job then fire it through run_one_job."""
         ran = {"job": "after-run", "last_status": "ok", "last_error": None}
-        claimed = {**_JOB, "fire_claim": {"by": "manual-owner"}}
+        claimed = {**_JOB, "fire_claim": {"by": "manual-owner"},
+                   "execution_id": "manual-exec"}
         with patch("tools.cronjob_tools.resolve_job_ref", return_value=dict(_JOB)), \
              patch("tools.cronjob_tools.claim_job_for_fire", return_value=claimed) as m_claim, \
              patch("cron.scheduler.run_one_job", return_value=True) as m_run, \
@@ -39,7 +92,9 @@ class TestCronjobRunExecutesImmediately:
         assert out["success"] is True
         assert out["job"]["executed"] is True
         assert out["job"]["execution_success"] is True
-        m_claim.assert_called_once_with("job-run-1", return_job=True)
+        m_claim.assert_called_once_with(
+            "job-run-1", return_job=True, execution_id="manual-exec",
+        )
         m_run.assert_called_once_with(claimed, adapters=None, loop=None, extra_prompt=None)
 
     def test_run_reconciles_external_provider_after_claimed_execution(self):
@@ -51,7 +106,8 @@ class TestCronjobRunExecutesImmediately:
         """
         order = []
         ran = {"id": "job-run-1", "last_status": "ok", "last_error": None}
-        claimed = {**_JOB, "fire_claim": {"by": "manual-owner"}}
+        claimed = {**_JOB, "fire_claim": {"by": "manual-owner"},
+                   "execution_id": "manual-exec"}
         with patch("tools.cronjob_tools.resolve_job_ref", return_value=dict(_JOB)), \
              patch("tools.cronjob_tools.claim_job_for_fire", return_value=claimed), \
              patch("cron.scheduler.run_one_job",
@@ -71,7 +127,8 @@ class TestCronjobRunExecutesImmediately:
         """A claimed direct run advances next_run_at at claim time, so the
         provider must be reconciled even when the execution itself fails."""
         failed = {"id": "job-run-1", "last_status": "error", "last_error": "provider 500"}
-        claimed = {**_JOB, "fire_claim": {"by": "manual-owner"}}
+        claimed = {**_JOB, "fire_claim": {"by": "manual-owner"},
+                   "execution_id": "manual-exec"}
         with patch("tools.cronjob_tools.resolve_job_ref", return_value=dict(_JOB)), \
              patch("tools.cronjob_tools.claim_job_for_fire", return_value=claimed), \
              patch("cron.scheduler.run_one_job", side_effect=RuntimeError("boom")), \
@@ -103,7 +160,8 @@ class TestCronjobRunExecutesImmediately:
     def test_run_reports_failure_from_last_status(self):
         """A failed run is reported via the re-read job's last_status/last_error."""
         failed = {"id": "job-run-1", "last_status": "error", "last_error": "provider 500"}
-        claimed = {**_JOB, "fire_claim": {"by": "manual-owner"}}
+        claimed = {**_JOB, "fire_claim": {"by": "manual-owner"},
+                   "execution_id": "manual-exec"}
         with patch("tools.cronjob_tools.resolve_job_ref", return_value=dict(_JOB)), \
              patch("tools.cronjob_tools.claim_job_for_fire", return_value=claimed), \
              patch("cron.scheduler.run_one_job", return_value=True), \
@@ -131,14 +189,17 @@ class TestCronjobRunExecutesImmediately:
         completed = {"id": "job-run-1", "last_status": "ok", "last_error": None}
 
         with patch("tools.cronjob_tools.claim_job_for_fire", return_value={**_JOB, "fire_claim": {"by": "manual-owner"}}), \
-             patch("gateway.run._gateway_runner_ref", return_value=runner), \
+             patch.dict(sys.modules, {
+                 "gateway.run": SimpleNamespace(_gateway_runner_ref=lambda: runner),
+             }), \
              patch("cron.scheduler.run_one_job", return_value=True) as m_run, \
              patch("tools.cronjob_tools.get_job", return_value=completed):
             res = _execute_job_now(dict(_JOB))
 
         assert res["success"] is True
         m_run.assert_called_once_with(
-            {**_JOB, "fire_claim": {"by": "manual-owner"}},
+            {**_JOB, "fire_claim": {"by": "manual-owner"},
+             "execution_id": "manual-exec"},
             adapters=adapters,
             loop=gateway_loop,
             extra_prompt=None,
@@ -156,7 +217,8 @@ class TestCronjobRunExecutesImmediately:
 
         assert res["success"] is True
         m_run.assert_called_once_with(
-            {**_JOB, "fire_claim": {"by": "manual-owner"}},
+            {**_JOB, "fire_claim": {"by": "manual-owner"},
+             "execution_id": "manual-exec"},
             adapters=None,
             loop=None,
             extra_prompt=None,

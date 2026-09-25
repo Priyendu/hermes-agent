@@ -942,7 +942,7 @@ def _execute_job_now(
     claimed_job = None
     try:
         # At-most-once claim: bail without running if a tick/other fire owns it.
-        claimed_job = claim_job_for_fire(job_id, return_job=True)
+        claimed_job = _claim_manual_execution(job_id)
         if not isinstance(claimed_job, dict):
             # claim_job_for_fire returns False for paused/disabled/missing
             # jobs too — don't mislabel those as "already being fired"
@@ -1136,6 +1136,34 @@ def _run_claimed_job(
         }
 
 
+def _claim_manual_execution(job_id: str):
+    """Create an execution row before taking a manual fire lease.
+
+    Linking the CAS claim to its execution row closes the crash window between
+    claim acquisition and ``run_one_job`` startup. If the lease is not acquired,
+    terminate the unused row so it cannot be mistaken for an interrupted run.
+    """
+    from cron.executions import create_execution, finish_execution
+
+    execution = create_execution(job_id, source="manual")
+    execution_id = execution["id"]
+    try:
+        claimed = claim_job_for_fire(
+            job_id, return_job=True, execution_id=execution_id,
+        )
+    except Exception:
+        finish_execution(
+            execution_id, success=False, error="manual fire claim failed",
+        )
+        raise
+    if not isinstance(claimed, dict):
+        finish_execution(
+            execution_id, success=False, error="manual fire claim not acquired",
+        )
+        return claimed
+    return {**claimed, "execution_id": execution_id}
+
+
 def _latest_job_output_excerpt(job_id: str, max_chars: int = 2000) -> Optional[str]:
     """Best-effort excerpt of the job's most recent saved output file.
 
@@ -1284,7 +1312,7 @@ def _try_dispatch_background_run(
 
         # Same snapshot claim as _execute_job_now: carry the owner-bearing
         # record into the run so terminal writes stay fenced by this owner.
-        claimed_job = claim_job_for_fire(job_id, return_job=True)
+        claimed_job = _claim_manual_execution(job_id)
         if not isinstance(claimed_job, dict):
             refreshed = get_job(job_id)
             if refreshed is None:
