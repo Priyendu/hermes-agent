@@ -645,7 +645,8 @@ from cron.jobs import (
     claim_dispatch,
     claim_job_for_fire,
     fire_claim_fence,
-    clear_run_claim,
+    clear_run_claim_for_execution,
+    clear_run_claim_if_matches,
     get_due_jobs,
     heartbeat_fire_claim,
     heartbeat_run_claim,
@@ -7906,11 +7907,28 @@ def tick(
                 execution_id=job.get("execution_id"),
             )
             if not claimed:
-                finish_execution(
-                    job["execution_id"],
-                    success=False,
-                    error="Fire claim lost; execution was not started.",
-                )
+                execution_id = str(job.get("execution_id") or "")
+                try:
+                    finish_execution(
+                        execution_id,
+                        success=False,
+                        error="Fire claim lost; execution was not started.",
+                    )
+                finally:
+                    if (execution_id
+                            and isinstance(job.get("schedule"), dict)
+                            and job["schedule"].get("kind") == "once"):
+                        try:
+                            clear_run_claim_for_execution(
+                                job["id"], execution_id=execution_id,
+                            )
+                        except Exception:
+                            logger.warning(
+                                "Could not clear one-shot run claim for job '%s' "
+                                "after losing its fire claim",
+                                job.get("name", job.get("id")),
+                                exc_info=True,
+                            )
                 return True
             # Production CAS returns the exact persisted record with its unique
             # owner. Bool fallback keeps older test doubles/API overrides
@@ -7944,27 +7962,41 @@ def tick(
             membership is released in the worker's finally block.
             """
             job_id = job["id"]
+            run_claim = job.get("run_claim")
+            run_claim_owner = (
+                str(run_claim.get("by") or "")
+                if isinstance(run_claim, dict) else ""
+            )
+            run_claim_at = (
+                str(run_claim.get("at") or "")
+                if isinstance(run_claim, dict) else ""
+            )
+            run_claim_execution_id = (
+                str(run_claim.get("execution_id"))
+                if isinstance(run_claim, dict)
+                and run_claim.get("execution_id") is not None else None
+            )
 
             def _clear_run_claim_best_effort() -> None:
                 """Best-effort claim cleanup on the dispatch-failure paths.
 
                 Only one-shot jobs carry a ``run_claim`` (stamped by
-                get_due_jobs, #59229), so recurring jobs skip the call
-                entirely — clear_run_claim acquires _jobs_lock (blocking
-                cross-process flock) and does a full load_jobs read, and the
-                dispatch-failure paths fire exactly when the process can
-                least afford N pointless lock/read round-trips (interpreter
-                shutdown, EMFILE).  clear_run_claim itself does
-                load_jobs/save_jobs file I/O; on those degraded paths it can
-                raise, and these early-exits exist precisely to skip cleanly
-                — a stale claim expiring at the TTL is a better outcome than
-                crashing the tick (#86522).
+                get_due_jobs, #59229), so recurring jobs skip the store access.
+                Clear only the exact claim snapshot this dispatch observed; a
+                later one-shot claim must survive stale-dispatch cleanup.
                 """
                 _schedule = job.get("schedule")
                 if not (isinstance(_schedule, dict) and _schedule.get("kind") == "once"):
                     return
+                if not run_claim_owner or not run_claim_at:
+                    return
                 try:
-                    clear_run_claim(job_id)
+                    clear_run_claim_if_matches(
+                        job_id,
+                        expected_owner=run_claim_owner,
+                        expected_at=run_claim_at,
+                        expected_execution_id=run_claim_execution_id,
+                    )
                 except Exception as claim_err:
                     logger.warning(
                         "Could not clear run_claim for job '%s' after dispatch "
@@ -7990,10 +8022,10 @@ def tick(
                 return None
             # Record the attempt before executor dispatch. Recovery classifies
             # abandoned records as unknown; it never automatically retries them.
+            execution = None
             try:
                 execution = create_execution(job_id, source="builtin")
                 dispatched_job = dict(job, execution_id=execution["id"])
-                run_claim = job.get("run_claim")
                 if (isinstance(job.get("schedule"), dict)
                         and job["schedule"].get("kind") == "once"
                         and isinstance(run_claim, dict)):
@@ -8003,6 +8035,7 @@ def tick(
                         expected_owner=str(run_claim.get("by") or ""),
                         expected_at=str(run_claim.get("at") or ""),
                     ):
+                        _clear_run_claim_best_effort()
                         finish_execution(
                             execution["id"],
                             success=False,
@@ -8018,6 +8051,7 @@ def tick(
                     dispatched_job["run_claim"] = {
                         **run_claim, "execution_id": execution["id"],
                     }
+                    run_claim_execution_id = str(execution["id"])
                 _ctx = contextvars.copy_context()
             except Exception as execution_err:
                 # Init/creation failure between the claim and the submit —
@@ -8027,8 +8061,25 @@ def tick(
                 # cleanup).
                 release_running_job(job_id)
                 _clear_run_claim_best_effort()
+                if isinstance(execution, dict) and execution.get("id"):
+                    try:
+                        finish_execution(
+                            execution["id"],
+                            success=False,
+                            error=(
+                                "Scheduler execution setup failed before dispatch: "
+                                f"{execution_err}"
+                            ),
+                        )
+                    except Exception:
+                        logger.error(
+                            "Could not terminalize scheduler execution %s after "
+                            "setup failed",
+                            execution.get("id"),
+                            exc_info=True,
+                        )
                 logger.exception(
-                    "Job '%s' not dispatched: execution creation failed: %s",
+                    "Job '%s' not dispatched: execution setup failed: %s",
                     job.get("name", job_id),
                     execution_err,
                 )

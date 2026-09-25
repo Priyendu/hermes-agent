@@ -62,6 +62,48 @@ class TestCronjobRunExecutesImmediately:
             "job-run-1", execution_id="manual-exec", expected_owner="manual-owner",
         )
 
+    def test_manual_pre_run_setup_failure_finishes_exact_execution(self):
+        from tools.cronjob_tools import _run_claimed_job
+
+        claimed = {
+            **_JOB,
+            "execution_id": "manual-exec",
+            "fire_claim": {
+                "by": "manual-owner", "execution_id": "manual-exec",
+            },
+        }
+        set_activity_callback(lambda _description: None)
+        try:
+            with patch("tools.cronjob_tools.threading.Thread") as thread, \
+                 patch("cron.scheduler.release_running_job") as release_running, \
+                 patch("cron.scheduler.run_one_job") as run, \
+                 patch("cron.executions.finish_execution") as finish, \
+                 patch("cron.jobs.release_unstarted_manual_fire_claim",
+                       return_value=True) as release_claim, \
+                 patch("tools.cronjob_tools.mark_job_run"):
+                thread.return_value.start.side_effect = RuntimeError(
+                    "heartbeat start failed"
+                )
+                result = _run_claimed_job(claimed, pre_registered=True)
+        finally:
+            set_activity_callback(None)
+
+        assert result["success"] is False
+        assert "heartbeat start failed" in result["error"]
+        run.assert_not_called()
+        finish.assert_called_once_with(
+            "manual-exec",
+            success=False,
+            error=(
+                "Manual execution setup failed before run start: "
+                "heartbeat start failed"
+            ),
+        )
+        release_claim.assert_called_once_with(
+            "job-run-1", execution_id="manual-exec", expected_owner="manual-owner",
+        )
+        release_running.assert_called_once_with("job-run-1")
+
     def test_manual_claim_registers_before_execution_and_fire_claim(self):
         from tools.cronjob_tools import _claim_manual_execution
 

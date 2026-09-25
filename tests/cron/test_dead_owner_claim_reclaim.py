@@ -384,6 +384,74 @@ class TestTickReapsDeadOwnerClaims:
 
         assert _run_tick() == 0
 
+    def test_lost_fire_claim_clears_only_its_linked_one_shot_claim(
+        self, executions, monkeypatch,
+    ):
+        """A scheduler loser must not strand its run_claim on the failed row."""
+        import cron.jobs as jobs
+
+        job = jobs.create_job(
+            prompt="x", schedule="in 30m", name="lost-fire-claim-oneshot",
+        )
+        snapshot = jobs.load_jobs()
+        record = next(row for row in snapshot if row["id"] == job["id"])
+        record["run_claim"] = {
+            "at": "2026-09-25T12:00:00+00:00",
+            "by": "scheduler-a",
+        }
+        jobs.save_jobs(snapshot)
+        due_job = jobs.get_job(job["id"])
+
+        monkeypatch.setattr(scheduler_mod, "get_due_jobs", lambda: [due_job])
+        monkeypatch.setattr(scheduler_mod, "advance_next_runs", lambda _ids: 0)
+        monkeypatch.setattr(scheduler_mod, "claim_job_for_fire", lambda *_a, **_k: False)
+
+        with (
+            patch.object(scheduler_mod, "run_one_job") as run,
+            patch("tools.mcp_tool._kill_orphaned_mcp_children", lambda: None),
+        ):
+            result = scheduler_mod.tick(verbose=False)
+
+        assert result == 1
+        execution = executions.latest_execution(job["id"])
+        assert execution["status"] == "failed"
+        assert execution["error"] == "Fire claim lost; execution was not started."
+        assert jobs.get_job(job["id"])["run_claim"] is None
+        run.assert_not_called()
+
+    def test_one_shot_binding_error_terminalizes_created_execution(
+        self, executions, monkeypatch,
+    ):
+        """A link I/O failure must not leave a live-owner claimed ledger row."""
+        import cron.jobs as jobs
+
+        job = jobs.create_job(
+            prompt="x", schedule="in 30m", name="binding-error-oneshot",
+        )
+        snapshot = jobs.load_jobs()
+        record = next(row for row in snapshot if row["id"] == job["id"])
+        record["run_claim"] = {
+            "at": "2026-09-25T12:00:00+00:00",
+            "by": "scheduler-a",
+        }
+        jobs.save_jobs(snapshot)
+        due_job = jobs.get_job(job["id"])
+
+        monkeypatch.setattr(scheduler_mod, "get_due_jobs", lambda: [due_job])
+        monkeypatch.setattr(scheduler_mod, "advance_next_runs", lambda _ids: 0)
+        def fail_link(*_args, **_kwargs):
+            raise OSError("jobs store unavailable")
+
+        monkeypatch.setattr(scheduler_mod, "link_run_claim_to_execution", fail_link)
+        with patch("tools.mcp_tool._kill_orphaned_mcp_children", lambda: None):
+            result = scheduler_mod.tick(verbose=False)
+
+        assert result == 0
+        execution = executions.latest_execution(job["id"])
+        assert execution["status"] == "failed"
+        assert "Scheduler execution setup failed before dispatch" in execution["error"]
+        assert jobs.get_job(job["id"])["run_claim"] is None
+
 
 class TestOneShotCliRunIsSynchronous:
     @pytest.fixture(autouse=True)

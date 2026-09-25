@@ -249,6 +249,61 @@ def test_one_shot_run_claim_links_only_to_exact_owner_timestamp_and_execution(
     assert jobs.get_job(job["id"])["run_claim"]["execution_id"] == "exec-1"
 
 
+def test_one_shot_run_claim_clear_is_fenced_to_exact_execution(temp_home):
+    import cron.jobs as jobs
+
+    job = jobs.create_job(prompt="x", schedule="in 30m", name="fenced-run-claim")
+    records = jobs.load_jobs()
+    record = next(row for row in records if row["id"] == job["id"])
+    record["run_claim"] = {
+        "at": "2026-09-25T12:00:00+00:00",
+        "by": "runner-a",
+        "execution_id": "exec-current",
+    }
+    jobs.save_jobs(records)
+
+    assert not jobs.clear_run_claim_for_execution(
+        job["id"], execution_id="exec-stale",
+    )
+    assert jobs.get_job(job["id"])["run_claim"]["execution_id"] == "exec-current"
+
+    assert jobs.clear_run_claim_for_execution(
+        job["id"], execution_id="exec-current",
+    )
+    assert jobs.get_job(job["id"])["run_claim"] is None
+
+
+def test_dispatch_cleanup_preserves_replacement_one_shot_claim(temp_home):
+    import cron.jobs as jobs
+
+    job = jobs.create_job(prompt="x", schedule="in 30m", name="replacement-run-claim")
+    original_at = "2026-09-25T12:00:00+00:00"
+    replacement_at = "2026-09-25T12:00:01+00:00"
+    records = jobs.load_jobs()
+    record = next(row for row in records if row["id"] == job["id"])
+    record["run_claim"] = {
+        "at": replacement_at,
+        "by": "runner-b",
+        "execution_id": "exec-b",
+    }
+    jobs.save_jobs(records)
+
+    assert not jobs.clear_run_claim_if_matches(
+        job["id"], expected_owner="runner-a", expected_at=original_at,
+    )
+    assert jobs.get_job(job["id"])["run_claim"] == {
+        "at": replacement_at,
+        "by": "runner-b",
+        "execution_id": "exec-b",
+    }
+
+    assert jobs.clear_run_claim_if_matches(
+        job["id"], expected_owner="runner-b", expected_at=replacement_at,
+        expected_execution_id="exec-b",
+    )
+    assert jobs.get_job(job["id"])["run_claim"] is None
+
+
 def test_fire_claim_fence_serializes_terminal_revocation(temp_home):
     """A side effect authorized by owner linearizes before terminal revocation."""
     from cron.jobs import (

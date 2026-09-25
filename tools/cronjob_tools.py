@@ -984,6 +984,7 @@ def _run_claimed_job(
     """
     job_id = job["id"]
     _registered = pre_registered
+    run_one_job_entered = False
     fire_owner = None
     try:
         from cron.scheduler import (
@@ -1096,6 +1097,7 @@ def _run_claimed_job(
         gateway_loop = getattr(runner, "_gateway_loop", None) if runner is not None else None
 
         try:
+            run_one_job_entered = True
             try:
                 processed = run_one_job(
                     job, adapters=adapters, loop=gateway_loop,
@@ -1118,6 +1120,17 @@ def _run_claimed_job(
 
     except Exception as e:
         logger.error("Failed to execute cron job %s immediately: %s", job_id, e)
+        if not run_one_job_entered:
+            try:
+                _finalize_unstarted_manual_claim(
+                    job,
+                    f"Manual execution setup failed before run start: {e}",
+                )
+            except Exception:
+                logger.exception(
+                    "Could not finalize unstarted manual execution for job %s",
+                    job_id,
+                )
         if _registered:
             # Registration succeeded but we raised before the run's own
             # release ran (e.g. heartbeat setup) — don't leave the job

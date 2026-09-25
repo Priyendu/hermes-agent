@@ -7,10 +7,9 @@ error) the job never reaches ``mark_job_run`` and the stale claim blocked
 re-dispatch until the TTL expired (default 30 min) — a precisely-timed
 one-shot reminder arrived up to 30 minutes late with no error surfaced.
 
-The fix (salvaged from PR #87591 by @RelaxJonh) adds
-``cron.jobs.clear_run_claim`` and calls it on all three ``_submit_with_guard``
-early-exit paths, wrapped best-effort so a failing store can never crash the
-tick these paths exist to protect.
+The fix (salvaged from PR #87591 by @RelaxJonh) clears the exact one-shot
+``run_claim`` snapshot on ``_submit_with_guard`` early-exit paths, wrapped
+best-effort so a failing store cannot crash the tick these paths protect.
 """
 from __future__ import annotations
 
@@ -46,7 +45,9 @@ def _make_oneshot(claimed: bool = True) -> dict:
             if j["id"] == job["id"]:
                 j["run_claim"] = {"at": "2026-08-17T10:00:00+00:00", "by": "test:1"}
         jobs_mod.save_jobs(jobs)
-    return job
+    # get_due_jobs returns its persisted run_claim snapshot to dispatch. Keep
+    # that shape here so fenced cleanup can prove which claim it owns.
+    return jobs_mod.get_job(job["id"])
 
 
 class TestClearRunClaim:
@@ -120,13 +121,14 @@ class TestDispatchFailurePathsClearClaim:
         assert job["id"] not in sched.get_running_job_ids()
 
     def test_clear_failure_is_best_effort_not_fatal(self, cron_store):
-        """A raising clear_run_claim (corrupt store, teardown I/O error) must
+        """A raising fenced run-claim clear (store I/O error) must
         not crash the tick — these early-exit paths exist to skip cleanly; the
         claim then simply expires at the TTL."""
         from cron import scheduler as sched
         job = _make_oneshot(claimed=True)
         with patch.object(sched, "_interpreter_shutting_down", return_value=True), \
-             patch.object(sched, "clear_run_claim", side_effect=OSError(24, "Too many open files")):
+             patch.object(sched, "clear_run_claim_if_matches",
+                          side_effect=OSError(24, "Too many open files")):
             n = self._tick_one(job)  # must not raise
         assert n == 0
 
@@ -138,6 +140,6 @@ class TestDispatchFailurePathsClearClaim:
         from cron import scheduler as sched
         job = jobs_mod.create_job(prompt="hourly", schedule="every 1h")
         with patch.object(sched, "_interpreter_shutting_down", return_value=True), \
-             patch.object(sched, "clear_run_claim") as mock_clear:
+             patch.object(sched, "clear_run_claim_if_matches") as mock_clear:
             self._tick_one(job)
         mock_clear.assert_not_called()

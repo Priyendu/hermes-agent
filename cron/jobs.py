@@ -3343,6 +3343,61 @@ def clear_run_claim(job_id: str) -> bool:
     return False
 
 
+def clear_run_claim_for_execution(job_id: str, *, execution_id: str) -> bool:
+    """Clear only the one-shot run claim still linked to ``execution_id``.
+
+    A scheduler attempt may lose its durable fire-claim CAS after linking a
+    one-shot claim. Its execution never starts, so release that exact run claim
+    without clearing a replacement installed by another dispatcher.
+    """
+    expected_execution_id = str(execution_id or "")
+    if not expected_execution_id:
+        return False
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if str(job.get("id")) != str(job_id):
+                continue
+            if job.get("schedule", {}).get("kind") != "once":
+                return False
+            claim = job.get("run_claim")
+            if (not isinstance(claim, dict)
+                    or str(claim.get("execution_id") or "")
+                    != expected_execution_id):
+                return False
+            job["run_claim"] = None
+            save_jobs(jobs)
+            return True
+    return False
+
+
+def clear_run_claim_if_matches(
+    job_id: str, *, expected_owner: str, expected_at: str,
+    expected_execution_id: Optional[str] = None,
+) -> bool:
+    """Clear a one-shot claim only if its full observed identity still matches."""
+    if not expected_owner or not expected_at:
+        return False
+    expected_id = str(expected_execution_id or "")
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if str(job.get("id")) != str(job_id):
+                continue
+            if job.get("schedule", {}).get("kind") != "once":
+                return False
+            claim = job.get("run_claim")
+            if (not isinstance(claim, dict)
+                    or claim.get("by") != expected_owner
+                    or claim.get("at") != expected_at
+                    or str(claim.get("execution_id") or "") != expected_id):
+                return False
+            job["run_claim"] = None
+            save_jobs(jobs)
+            return True
+    return False
+
+
 def link_run_claim_to_execution(
     job_id: str, *, execution_id: str, expected_owner: str, expected_at: str,
 ) -> bool:
