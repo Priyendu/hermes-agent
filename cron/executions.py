@@ -30,15 +30,28 @@ _PROCESS_ID = uuid.uuid4().hex
 logger = logging.getLogger(__name__)
 
 
-def _owner_host_id() -> str:
-    """Stable host identity used to avoid treating remote PIDs as locally dead."""
+def _owner_host_id() -> Optional[str]:
+    """Return the deployment's stable host identity, or fail closed.
+
+    Container hostnames may change across recreation, so a hostname fallback
+    can turn a still-live remote PID into a false dead-owner proof. Recovery
+    prefers an explicitly configured identity that remains stable across
+    restarts. A normal host hostname is a compatible stable fallback, but a
+    Docker-generated hex container ID is not; without a stable identity the
+    owner is indeterminate and is preserved.
+    """
     configured = os.getenv("HERMES_MACHINE_ID", "").strip()
     if configured:
         return configured
     try:
-        return socket.gethostname()
+        hostname = socket.gethostname().strip()
     except Exception:
-        return "unknown"
+        return None
+    if not hostname or (12 <= len(hostname) <= 64
+                        and all(char in "0123456789abcdefABCDEF"
+                                for char in hostname)):
+        return None
+    return hostname
 
 
 def _connect() -> sqlite3.Connection:
@@ -77,7 +90,25 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         row[1] for row in conn.execute("PRAGMA table_info(executions)").fetchall()
     }
     if "owner_host_id" not in columns:
-        conn.execute("ALTER TABLE executions ADD COLUMN owner_host_id TEXT")
+        # Serialize the check-and-ALTER across processes. The initial check is
+        # only a fast path; after acquiring SQLite's write reservation, re-read
+        # the schema because another process may have completed the migration.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            columns = {
+                row[1]
+                for row in conn.execute(
+                    "PRAGMA table_info(executions)"
+                ).fetchall()
+            }
+            if "owner_host_id" not in columns:
+                conn.execute(
+                    "ALTER TABLE executions ADD COLUMN owner_host_id TEXT"
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_job_claimed "
         "ON executions(job_id, claimed_at DESC, id DESC)"
@@ -141,7 +172,10 @@ def _process_start_time(pid: int) -> Optional[int]:
 def _owner_is_live(
     pid: int, started_at: Optional[int], owner_host_id: Optional[str] = None
 ) -> bool:
-    if owner_host_id and owner_host_id != _owner_host_id():
+    current_host_id = _owner_host_id()
+    if not owner_host_id or not current_host_id:
+        return True  # missing identity cannot prove this PID belongs to us
+    if owner_host_id != current_host_id:
         return True  # a remote PID cannot be disproved from this host
     try:
         from gateway.status import _pid_exists

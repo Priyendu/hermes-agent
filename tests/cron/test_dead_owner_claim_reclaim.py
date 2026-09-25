@@ -34,6 +34,7 @@ def executions(monkeypatch, tmp_path):
     import cron.executions as executions_mod
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("HERMES_MACHINE_ID", "test-stable-host")
     monkeypatch.setattr(
         executions_mod, "EXECUTIONS_FILE", tmp_path / "cron" / "executions.db"
     )
@@ -202,6 +203,42 @@ class TestTickReapsDeadOwnerClaims:
         assert executions.recover_interrupted_executions() == 0
         assert executions.latest_execution(job["id"])["status"] == "claimed"
         assert get_job(job["id"])["fire_claim"] == claim_before
+
+    def test_missing_owner_host_id_preserves_claim_even_when_pid_is_absent(
+        self, executions
+    ):
+        """Pre-migration rows have no proof that their PID is local."""
+        from cron.jobs import claim_job_for_fire, create_job, get_job
+
+        job = create_job(prompt="x", schedule="every 1m", name="unknown-host-claim")
+        record = executions.create_execution(job["id"], source="builtin")
+        claimed = claim_job_for_fire(
+            job["id"], return_job=True, execution_id=record["id"]
+        )
+        claim_before = dict(claimed["fire_claim"])
+        with executions._transaction() as conn:
+            conn.execute(
+                "UPDATE executions SET owner_host_id=NULL, process_id=?, pid=?, "
+                "process_started_at=NULL WHERE id=?",
+                ("legacy-owner", _dead_pid(), record["id"]),
+            )
+
+        assert executions.recover_interrupted_executions() == 0
+        assert executions.latest_execution(job["id"])["status"] == "claimed"
+        assert get_job(job["id"])["fire_claim"] == claim_before
+
+    def test_owner_host_id_requires_stable_configured_identity(
+        self, executions, monkeypatch
+    ):
+        monkeypatch.delenv("HERMES_MACHINE_ID")
+        monkeypatch.setattr(executions.socket, "gethostname", lambda: "0123456789ab")
+        assert executions._owner_host_id() is None
+
+        monkeypatch.setattr(executions.socket, "gethostname", lambda: "stable-host")
+        assert executions._owner_host_id() == "stable-host"
+
+        monkeypatch.setenv("HERMES_MACHINE_ID", "stable-host-across-restarts")
+        assert executions._owner_host_id() == "stable-host-across-restarts"
 
     def test_recovery_does_not_clear_a_replacement_execution_claim(self, executions):
         """A stale recovery candidate cannot revoke a newer claim by the same job."""

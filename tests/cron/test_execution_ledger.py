@@ -7,6 +7,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 
@@ -94,6 +95,55 @@ def test_existing_execution_ledger_adds_optional_owner_host_column(monkeypatch, 
         assert "owner_host_id" in columns
 
 
+def test_concurrent_startup_serializes_owner_host_column_migration(
+    monkeypatch, tmp_path
+):
+    """Two process-like connections may open the old ledger simultaneously."""
+    executions = _point_ledger(monkeypatch, tmp_path)
+    db_path = executions.EXECUTIONS_FILE
+    db_path.parent.mkdir(parents=True)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            """CREATE TABLE executions (
+                 id TEXT PRIMARY KEY,
+                 job_id TEXT NOT NULL,
+                 source TEXT NOT NULL,
+                 process_id TEXT NOT NULL,
+                 pid INTEGER NOT NULL,
+                 process_started_at INTEGER,
+                 status TEXT NOT NULL,
+                 claimed_at TEXT NOT NULL,
+                 started_at TEXT,
+                 finished_at TEXT,
+                 error TEXT
+               )"""
+        )
+
+    barrier = threading.Barrier(2)
+    errors = []
+
+    def initialize():
+        try:
+            with sqlite3.connect(db_path, timeout=5) as conn:
+                barrier.wait(timeout=5)
+                executions._initialize_schema(conn)
+        except Exception as exc:  # assert worker errors in the test thread
+            errors.append(exc)
+
+    workers = [threading.Thread(target=initialize) for _ in range(2)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=10)
+
+    assert all(not worker.is_alive() for worker in workers)
+    assert errors == []
+    with sqlite3.connect(db_path) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(executions)")}
+    assert "owner_host_id" in columns
+
+
 def test_terminal_execution_cannot_be_rewritten(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
     record = executions.create_execution("immutable", source="builtin")
@@ -175,6 +225,7 @@ def test_restart_marks_interrupted_execution_unknown_without_requeue(tmp_path):
     repo = Path(__file__).resolve().parents[2]
     env = os.environ.copy()
     env["HERMES_HOME"] = str(home)
+    env["HERMES_MACHINE_ID"] = "stable-test-host"
     env["PYTHONPATH"] = str(repo)
 
     create = subprocess.run(
