@@ -64,6 +64,7 @@ services:
     image: hermes-agent
     container_name: hermes-dashboard
     restart: unless-stopped
+    init: true
     network_mode: host
     depends_on:
       - gateway
