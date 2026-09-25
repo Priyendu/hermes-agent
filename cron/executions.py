@@ -33,39 +33,39 @@ logger = logging.getLogger(__name__)
 def _owner_host_id() -> Optional[str]:
     """Return the deployment's stable host identity, or fail closed.
 
-    Container hostnames may change across recreation, so a hostname fallback
-    can turn a still-live remote PID into a false dead-owner proof. Recovery
-    prefers an explicitly configured identity that remains stable across
-    restarts. A normal host hostname is a compatible stable fallback, but a
-    Docker-generated hex container ID is not; without a stable identity the
-    owner is indeterminate and is preserved.
+    A service-specific internal identity or stable hostname distinguishes
+    concurrently active PID namespaces. A profile-level configured identity
+    is a fallback only for deployments with an unstable hostname; it must not
+    override a stable service hostname because several services can share one
+    profile/config while using isolated PID namespaces. Docker-generated hex
+    container IDs are not stable, so without another identity the owner is
+    indeterminate and is preserved.
     """
-    # Behavioral configuration belongs in config.yaml. The environment value
-    # is retained only as an internal bridge for managed runtimes/tests.
-    configured = ""
+    internal_identity = os.getenv("HERMES_MACHINE_ID", "").strip()
+    if internal_identity:
+        return internal_identity
+    try:
+        hostname = socket.gethostname().strip()
+    except Exception:
+        return None
+    if hostname and not (12 <= len(hostname) <= 64
+                         and all(char in "0123456789abcdefABCDEF"
+                                 for char in hostname)):
+        return hostname
+
+    # This profile-level fallback is useful for single-identity deployments
+    # with ephemeral hostnames. Stable service hostnames/internal identities
+    # take precedence when several PID namespaces share the profile.
     try:
         from hermes_cli.config import load_config_readonly
 
         cron_config = (load_config_readonly() or {}).get("cron") or {}
         value = cron_config.get("machine_id", "")
-        if isinstance(value, str):
-            configured = value.strip()
+        if isinstance(value, str) and value.strip():
+            return value.strip()
     except Exception:
         pass
-    if configured:
-        return configured
-    configured = os.getenv("HERMES_MACHINE_ID", "").strip()
-    if configured:
-        return configured
-    try:
-        hostname = socket.gethostname().strip()
-    except Exception:
-        return None
-    if not hostname or (12 <= len(hostname) <= 64
-                        and all(char in "0123456789abcdefABCDEF"
-                                for char in hostname)):
-        return None
-    return hostname
+    return None
 
 
 def _connect() -> sqlite3.Connection:

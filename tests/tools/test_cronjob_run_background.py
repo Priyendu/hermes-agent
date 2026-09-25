@@ -209,6 +209,9 @@ class TestSyncFallbacks:
         assert res["dispatched"] is False
         assert res["success"] is True
         m_run.assert_called_once()   # ran inline on this thread
+        inline_job = m_run.call_args.args[0]
+        assert inline_job["execution_id"] == "manual-exec-job-bg-07"
+        assert inline_job["fire_claim"]["by"] == "bg-owner"
 
 
 class TestInFlightDedupe:

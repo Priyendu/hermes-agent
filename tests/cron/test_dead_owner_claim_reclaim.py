@@ -138,6 +138,41 @@ class TestTickReapsDeadOwnerClaims:
         )
         assert retry_claim["fire_claim"]["execution_id"] == retry_execution["id"]
 
+    def test_recovery_clears_execution_bound_oneshot_run_claim(self, executions):
+        """A dead pre-start one-shot must not wait out its full run-claim TTL."""
+        import cron.jobs as jobs
+
+        job = jobs.create_job(prompt="x", schedule="in 30m", name="orphaned-once")
+        record = executions.create_execution(job["id"], source="builtin")
+        records = jobs.load_jobs()
+        persisted = next(row for row in records if row["id"] == job["id"])
+        persisted["run_claim"] = {
+            "at": "2026-09-25T12:00:00+00:00",
+            "by": "one-shot-runner",
+        }
+        jobs.save_jobs(records)
+        assert jobs.link_run_claim_to_execution(
+            job["id"], execution_id=record["id"],
+            expected_owner="one-shot-runner",
+            expected_at="2026-09-25T12:00:00+00:00",
+        )
+        claimed = jobs.claim_job_for_fire(
+            job["id"], return_job=True, execution_id=record["id"]
+        )
+        assert claimed["fire_claim"]["execution_id"] == record["id"]
+
+        with executions._transaction() as conn:
+            conn.execute(
+                "UPDATE executions SET process_id='dead-gateway', pid=?, "
+                "process_started_at=NULL WHERE id=?",
+                (_dead_pid(), record["id"]),
+            )
+
+        assert executions.recover_interrupted_executions() == 1
+        recovered = jobs.get_job(job["id"])
+        assert recovered["fire_claim"] is None
+        assert recovered["run_claim"] is None
+
     def test_recovery_clears_matching_legacy_claim_only_without_live_owner(
         self, executions
     ):
@@ -240,14 +275,27 @@ class TestTickReapsDeadOwnerClaims:
         monkeypatch.setenv("HERMES_MACHINE_ID", "stable-host-across-restarts")
         assert executions._owner_host_id() == "stable-host-across-restarts"
 
-    def test_owner_host_id_prefers_configured_machine_id(self, executions, monkeypatch):
+    def test_owner_host_id_uses_config_only_for_ephemeral_hostname(
+        self, executions, monkeypatch
+    ):
         monkeypatch.delenv("HERMES_MACHINE_ID", raising=False)
-        monkeypatch.setattr(executions.socket, "gethostname", lambda: "ephemeral")
+        monkeypatch.setattr(executions.socket, "gethostname", lambda: "0123456789ab")
         with patch(
             "hermes_cli.config.load_config_readonly",
             return_value={"cron": {"machine_id": "stable-config-host"}},
         ):
             assert executions._owner_host_id() == "stable-config-host"
+
+    def test_owner_host_id_prefers_service_hostname_over_shared_profile_config(
+        self, executions, monkeypatch
+    ):
+        monkeypatch.delenv("HERMES_MACHINE_ID", raising=False)
+        monkeypatch.setattr(executions.socket, "gethostname", lambda: "hermes-dashboard")
+        with patch(
+            "hermes_cli.config.load_config_readonly",
+            return_value={"cron": {"machine_id": "shared-profile-id"}},
+        ):
+            assert executions._owner_host_id() == "hermes-dashboard"
 
     def test_recovery_does_not_clear_a_replacement_execution_claim(self, executions):
         """A stale recovery candidate cannot revoke a newer claim by the same job."""

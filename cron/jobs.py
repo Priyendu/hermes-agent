@@ -3343,6 +3343,37 @@ def clear_run_claim(job_id: str) -> bool:
     return False
 
 
+def link_run_claim_to_execution(
+    job_id: str, *, execution_id: str, expected_owner: str, expected_at: str,
+) -> bool:
+    """Bind a due one-shot's run claim to its newly-created execution.
+
+    Exact owner/timestamp comparison fences a later due claim that replaced
+    this one between ``get_due_jobs`` and execution creation. Existing links
+    are idempotent only for the same execution ID.
+    """
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if str(job.get("id")) != str(job_id):
+                continue
+            if job.get("schedule", {}).get("kind") != "once":
+                return False
+            claim = job.get("run_claim")
+            if (not isinstance(claim, dict)
+                    or claim.get("by") != expected_owner
+                    or claim.get("at") != expected_at):
+                return False
+            current_execution_id = claim.get("execution_id")
+            if (current_execution_id is not None
+                    and str(current_execution_id) != str(execution_id)):
+                return False
+            claim["execution_id"] = str(execution_id)
+            save_jobs(jobs)
+            return True
+    return False
+
+
 def advance_next_runs(job_ids) -> int:
     """Batch form of :func:`advance_next_run` for the due-dispatch loop.
 
@@ -3402,10 +3433,24 @@ def advance_next_run(job_id: str) -> bool:
 def _machine_id() -> str:
     """Stable-ish identifier for claim attribution/debugging (NOT correctness).
 
-    Uses configured ``cron.machine_id``, then the internal environment
-    bridge, else hostname + pid. CAS correctness comes from the file lock and
-    fresh-claim check, not from this value.
+    Uses the internal service identity, then a stable hostname, then
+    configured ``cron.machine_id`` for otherwise ephemeral hosts. CAS
+    correctness comes from the file lock and fresh-claim check, not from this
+    value.
     """
+    explicit = os.getenv("HERMES_MACHINE_ID", "").strip()
+    if explicit:
+        return explicit
+    try:
+        import socket
+
+        host = socket.gethostname().strip()
+        if host and not (12 <= len(host) <= 64
+                         and all(char in "0123456789abcdefABCDEF"
+                                 for char in host)):
+            return host
+    except Exception:
+        pass
     try:
         from hermes_cli.config import load_config_readonly
 
@@ -3415,9 +3460,6 @@ def _machine_id() -> str:
             return configured.strip()
     except Exception:
         pass
-    explicit = os.getenv("HERMES_MACHINE_ID", "").strip()
-    if explicit:
-        return explicit
     try:
         import socket
         host = socket.gethostname()
@@ -3657,14 +3699,13 @@ def clear_recovered_fire_claim(
     execution_claimed_at: str,
     recovery_finished_at: str,
 ) -> bool:
-    """Clear only a fire lease belonging to a dead, not-started execution.
+    """Clear only claims belonging to a dead, not-started execution.
 
-    New claims carry their execution id, making recovery an exact compare-and-
-    clear. Older persisted claims have no execution id; for those, require the
-    claim timestamp to fall inside the recovered execution's lifetime and
-    recheck under the per-job fire lock that no claimed/running execution now
-    owns the job. Ambiguous or live ownership keeps the lease for normal TTL
-    expiry.
+    New fire and one-shot run claims carry their execution id, making recovery
+    an exact compare-and-clear. Older fire claims have no execution id; for
+    those, require the claim timestamp to fall inside the recovered execution's
+    lifetime and recheck that no active execution now owns the job. Legacy
+    one-shot run claims without an execution id remain until their TTL.
     """
     from datetime import datetime
     from cron.executions import _owner_host_id, has_active_execution
@@ -3682,37 +3723,48 @@ def clear_recovered_fire_claim(
             for job in jobs:
                 if str(job.get("id")) != str(job_id):
                     continue
-                claim = job.get("fire_claim")
-                if not isinstance(claim, dict):
+                changed = False
+                fire_claim = job.get("fire_claim")
+                if isinstance(fire_claim, dict):
+                    claim_execution_id = fire_claim.get("execution_id")
+                    if claim_execution_id is not None:
+                        if str(claim_execution_id) == str(execution_id):
+                            job["fire_claim"] = None
+                            changed = True
+                    else:
+                        # Legacy leases cannot be matched by ID. Only clear
+                        # when their timestamp is in this execution window
+                        # and no live execution remains.
+                        try:
+                            claim_at = _ensure_aware(
+                                datetime.fromisoformat(fire_claim["at"])
+                            )
+                            started_at = _ensure_aware(
+                                datetime.fromisoformat(execution_claimed_at)
+                            )
+                            recovered_at = _ensure_aware(
+                                datetime.fromisoformat(recovery_finished_at)
+                            )
+                        except (KeyError, TypeError, ValueError):
+                            claim_at = started_at = recovered_at = None
+                        if (claim_at is not None
+                                and started_at is not None
+                                and recovered_at is not None
+                                and started_at <= claim_at <= recovered_at
+                                and not has_active_execution(job_id)):
+                            job["fire_claim"] = None
+                            changed = True
+
+                run_claim = job.get("run_claim")
+                if (job.get("schedule", {}).get("kind") == "once"
+                        and isinstance(run_claim, dict)
+                        and str(run_claim.get("execution_id") or "")
+                        == str(execution_id)):
+                    job["run_claim"] = None
+                    changed = True
+
+                if not changed:
                     return False
-
-                claim_execution_id = claim.get("execution_id")
-                if claim_execution_id is not None:
-                    if str(claim_execution_id) != str(execution_id):
-                        return False
-                else:
-                    # Legacy leases cannot be matched by id. Only clear when
-                    # their timestamp is within this exact not-started
-                    # execution window and no live execution remains. A live
-                    # claimant persists its execution row before it attempts
-                    # the fire-claim CAS.
-                    try:
-                        claim_at = _ensure_aware(datetime.fromisoformat(claim["at"]))
-                        started_at = _ensure_aware(
-                            datetime.fromisoformat(execution_claimed_at)
-                        )
-                        recovered_at = _ensure_aware(
-                            datetime.fromisoformat(recovery_finished_at)
-                        )
-                    except (KeyError, TypeError, ValueError):
-                        return False
-                    if not started_at <= claim_at <= recovered_at:
-                        return False
-
-                    if has_active_execution(job_id):
-                        return False
-
-                job["fire_claim"] = None
                 save_jobs(jobs)
                 return True
     return False

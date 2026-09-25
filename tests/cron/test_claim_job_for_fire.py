@@ -205,11 +205,48 @@ def test_claim_attribution_uses_configured_machine_id(monkeypatch):
     import cron.jobs as jobs
 
     monkeypatch.delenv("HERMES_MACHINE_ID", raising=False)
-    with patch(
+    with patch("socket.gethostname", return_value="0123456789ab"), patch(
         "hermes_cli.config.load_config_readonly",
         return_value={"cron": {"machine_id": "stable-config-host"}},
     ):
         assert jobs._machine_id() == "stable-config-host"
+
+
+def test_one_shot_run_claim_links_only_to_exact_owner_timestamp_and_execution(
+    temp_home,
+):
+    import cron.jobs as jobs
+
+    job = jobs.create_job(prompt="x", schedule="in 30m", name="link-run-claim")
+    records = jobs.load_jobs()
+    record = next(row for row in records if row["id"] == job["id"])
+    record["run_claim"] = {
+        "at": "2026-09-25T12:00:00+00:00",
+        "by": "runner-a",
+    }
+    jobs.save_jobs(records)
+
+    assert not jobs.link_run_claim_to_execution(
+        job["id"], execution_id="exec-1", expected_owner="runner-b",
+        expected_at="2026-09-25T12:00:00+00:00",
+    )
+    assert not jobs.link_run_claim_to_execution(
+        job["id"], execution_id="exec-1", expected_owner="runner-a",
+        expected_at="2026-09-25T12:00:01+00:00",
+    )
+    assert jobs.link_run_claim_to_execution(
+        job["id"], execution_id="exec-1", expected_owner="runner-a",
+        expected_at="2026-09-25T12:00:00+00:00",
+    )
+    assert jobs.link_run_claim_to_execution(
+        job["id"], execution_id="exec-1", expected_owner="runner-a",
+        expected_at="2026-09-25T12:00:00+00:00",
+    )
+    assert not jobs.link_run_claim_to_execution(
+        job["id"], execution_id="exec-2", expected_owner="runner-a",
+        expected_at="2026-09-25T12:00:00+00:00",
+    )
+    assert jobs.get_job(job["id"])["run_claim"]["execution_id"] == "exec-1"
 
 
 def test_fire_claim_fence_serializes_terminal_revocation(temp_home):

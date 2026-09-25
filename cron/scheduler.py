@@ -649,6 +649,7 @@ from cron.jobs import (
     get_due_jobs,
     heartbeat_fire_claim,
     heartbeat_run_claim,
+    link_run_claim_to_execution,
     mark_job_run,
     save_job_output,
     use_cron_store,
@@ -7992,6 +7993,31 @@ def tick(
             try:
                 execution = create_execution(job_id, source="builtin")
                 dispatched_job = dict(job, execution_id=execution["id"])
+                run_claim = job.get("run_claim")
+                if (isinstance(job.get("schedule"), dict)
+                        and job["schedule"].get("kind") == "once"
+                        and isinstance(run_claim, dict)):
+                    if not link_run_claim_to_execution(
+                        job_id,
+                        execution_id=execution["id"],
+                        expected_owner=str(run_claim.get("by") or ""),
+                        expected_at=str(run_claim.get("at") or ""),
+                    ):
+                        finish_execution(
+                            execution["id"],
+                            success=False,
+                            error="One-shot run claim changed before execution binding.",
+                        )
+                        release_running_job(job_id)
+                        logger.warning(
+                            "Job '%s' not dispatched: one-shot run claim changed "
+                            "before execution binding",
+                            job.get("name", job_id),
+                        )
+                        return None
+                    dispatched_job["run_claim"] = {
+                        **run_claim, "execution_id": execution["id"],
+                    }
                 _ctx = contextvars.copy_context()
             except Exception as execution_err:
                 # Init/creation failure between the claim and the submit —
