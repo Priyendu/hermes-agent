@@ -371,6 +371,10 @@ def test_fire_due_default_claims_then_runs(monkeypatch):
     ran = []
     claims = []
     monkeypatch.setattr(
+        "cron.executions.create_execution",
+        lambda _jid, source: {"id": "fire-execution-1", "source": source},
+    )
+    monkeypatch.setattr(
         jobs,
         "claim_job_for_fire",
         lambda jid, **kw: claims.append((jid, kw))
@@ -384,7 +388,10 @@ def test_fire_due_default_claims_then_runs(monkeypatch):
     )
 
     assert InProcessCronScheduler().fire_due("j1") is True
-    assert claims == [("j1", {"return_job": True})]
+    assert claims == [(
+        "j1",
+        {"return_job": True, "execution_id": "fire-execution-1"},
+    )]
     assert ran == [("j1", "exact-owner")]
 
 
@@ -398,7 +405,7 @@ def test_claim_fire_persists_attempt_before_fire_claimed(monkeypatch):
     monkeypatch.setattr(
         jobs,
         "claim_job_for_fire",
-        lambda jid, **kwargs: events.append("claim")
+        lambda jid, **kwargs: events.append(("claim", kwargs))
         or {"id": jid, "fire_claim": {"by": "owner"}},
     )
     monkeypatch.setattr(
@@ -415,11 +422,18 @@ def test_claim_fire_persists_attempt_before_fire_claimed(monkeypatch):
     provider = InProcessCronScheduler()
     claimed = provider.claim_fire("j1")
 
-    assert events == ["ledger", "claim"]
+    assert events == [
+        "ledger",
+        ("claim", {"return_job": True, "execution_id": "exec-1"}),
+    ]
     assert claimed is not None
     assert claimed["execution_id"] == "exec-1"
     assert provider.fire_claimed(claimed) is True
-    assert events == ["ledger", "claim", ("run", "exec-1")]
+    assert events == [
+        "ledger",
+        ("claim", {"return_job": True, "execution_id": "exec-1"}),
+        ("run", "exec-1"),
+    ]
 
 
 def test_fire_due_forwards_manual_force_to_store_claim(monkeypatch):
@@ -429,6 +443,10 @@ def test_fire_due_forwards_manual_force_to_store_claim(monkeypatch):
 
     claims = []
     monkeypatch.setattr(
+        "cron.executions.create_execution",
+        lambda _jid, source: {"id": "forced-execution-1", "source": source},
+    )
+    monkeypatch.setattr(
         jobs,
         "claim_job_for_fire",
         lambda jid, **kw: claims.append((jid, kw))
@@ -437,7 +455,14 @@ def test_fire_due_forwards_manual_force_to_store_claim(monkeypatch):
     monkeypatch.setattr(sched, "run_one_job", lambda job, **kw: True)
 
     assert InProcessCronScheduler().fire_due("j1", force=True) is True
-    assert claims == [("j1", {"force": True, "return_job": True})]
+    assert claims == [(
+        "j1",
+        {
+            "return_job": True,
+            "execution_id": "forced-execution-1",
+            "force": True,
+        },
+    )]
 
 
 def test_fire_due_lost_claim_does_not_run(monkeypatch):

@@ -7899,7 +7899,11 @@ def tick(
             # Acquire the durable claim only when this worker actually starts,
             # not while it may wait behind other work in an executor queue.
             # This prevents a queued lease from expiring before execution.
-            claimed = claim_job_for_fire(job["id"], return_job=True)
+            claimed = claim_job_for_fire(
+                job["id"],
+                return_job=True,
+                execution_id=job.get("execution_id"),
+            )
             if not claimed:
                 finish_execution(
                     job["execution_id"],

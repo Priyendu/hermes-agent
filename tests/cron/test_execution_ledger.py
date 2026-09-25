@@ -57,6 +57,43 @@ def test_execution_ledger_follows_the_current_profile_home(monkeypatch, tmp_path
     assert (tmp_path / "worker" / "cron" / "executions.db").is_file()
 
 
+def test_existing_execution_ledger_adds_optional_owner_host_column(monkeypatch, tmp_path):
+    """Upgrade the pre-host-identity schema without dropping execution rows."""
+    executions = _point_ledger(monkeypatch, tmp_path)
+    db_path = executions.EXECUTIONS_FILE
+    db_path.parent.mkdir(parents=True)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """CREATE TABLE executions (
+                 id TEXT PRIMARY KEY,
+                 job_id TEXT NOT NULL,
+                 source TEXT NOT NULL,
+                 process_id TEXT NOT NULL,
+                 pid INTEGER NOT NULL,
+                 process_started_at INTEGER,
+                 status TEXT NOT NULL,
+                 claimed_at TEXT NOT NULL,
+                 started_at TEXT,
+                 finished_at TEXT,
+                 error TEXT
+               )"""
+        )
+        conn.execute(
+            "INSERT INTO executions "
+            "(id, job_id, source, process_id, pid, status, claimed_at) "
+            "VALUES ('legacy', 'legacy-job', 'builtin', 'legacy-process', 1, "
+            "'unknown', '2026-09-25T00:00:00+00:00')"
+        )
+
+    rows = executions.list_executions(job_id="legacy-job")
+    assert len(rows) == 1
+    assert rows[0]["id"] == "legacy"
+    assert "owner_host_id" not in rows[0]
+    with sqlite3.connect(db_path) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(executions)")}
+        assert "owner_host_id" in columns
+
+
 def test_terminal_execution_cannot_be_rewritten(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
     record = executions.create_execution("immutable", source="builtin")

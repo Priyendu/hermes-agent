@@ -33,6 +33,7 @@ import cron.scheduler as scheduler_mod
 def executions(monkeypatch, tmp_path):
     import cron.executions as executions_mod
 
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     monkeypatch.setattr(
         executions_mod, "EXECUTIONS_FILE", tmp_path / "cron" / "executions.db"
     )
@@ -105,6 +106,151 @@ class TestTickReapsDeadOwnerClaims:
         _run_tick()
 
         assert executions.latest_execution("orphaned-running")["status"] == "unknown"
+
+    def test_recovery_clears_matching_not_started_fire_claim_and_allows_next_fire(
+        self, executions
+    ):
+        """A dead pre-start owner must not leave the next gateway behind the TTL."""
+        from cron.jobs import claim_job_for_fire, create_job, get_job
+
+        job = create_job(prompt="x", schedule="every 1m", name="restart-fire-claim")
+        record = executions.create_execution(job["id"], source="builtin")
+        claimed = claim_job_for_fire(
+            job["id"], return_job=True, execution_id=record["id"]
+        )
+        assert claimed["fire_claim"]["execution_id"] == record["id"]
+
+        with executions._transaction() as conn:
+            conn.execute(
+                "UPDATE executions SET process_id='dead-gateway', pid=?, "
+                "process_started_at=NULL WHERE id=?",
+                (_dead_pid(), record["id"]),
+            )
+
+        assert executions.recover_interrupted_executions() == 1
+        assert executions.latest_execution(job["id"])["status"] == "unknown"
+        assert get_job(job["id"])["fire_claim"] is None
+
+        retry_execution = executions.create_execution(job["id"], source="builtin")
+        retry_claim = claim_job_for_fire(
+            job["id"], return_job=True, execution_id=retry_execution["id"]
+        )
+        assert retry_claim["fire_claim"]["execution_id"] == retry_execution["id"]
+
+    def test_recovery_clears_matching_legacy_claim_only_without_live_owner(
+        self, executions
+    ):
+        """Pre-upgrade claims can be correlated by time only absent any live row."""
+        from cron.jobs import claim_job_for_fire, create_job, get_job
+
+        job = create_job(prompt="x", schedule="every 1m", name="legacy-fire-claim")
+        record = executions.create_execution(job["id"], source="builtin")
+        assert claim_job_for_fire(job["id"], return_job=True)
+        assert "execution_id" not in get_job(job["id"])["fire_claim"]
+        with executions._transaction() as conn:
+            conn.execute(
+                "UPDATE executions SET process_id='dead-gateway', pid=?, "
+                "process_started_at=NULL WHERE id=?",
+                (_dead_pid(), record["id"]),
+            )
+
+        assert executions.recover_interrupted_executions() == 1
+        assert get_job(job["id"])["fire_claim"] is None
+
+    def test_recovery_preserves_fire_claim_for_started_dead_execution(
+        self, executions
+    ):
+        """Unknown side effects stay protected by the normal fire-claim TTL."""
+        from cron.jobs import claim_job_for_fire, create_job, get_job
+
+        job = create_job(prompt="x", schedule="every 1m", name="started-fire-claim")
+        record = executions.create_execution(job["id"], source="builtin")
+        executions.mark_execution_running(record["id"])
+        claimed = claim_job_for_fire(
+            job["id"], return_job=True, execution_id=record["id"]
+        )
+        claim_before = dict(claimed["fire_claim"])
+        with executions._transaction() as conn:
+            conn.execute(
+                "UPDATE executions SET process_id='dead-gateway', pid=?, "
+                "process_started_at=NULL WHERE id=?",
+                (_dead_pid(), record["id"]),
+            )
+
+        assert executions.recover_interrupted_executions() == 1
+        assert executions.latest_execution(job["id"])["status"] == "unknown"
+        assert get_job(job["id"])["fire_claim"] == claim_before
+
+    def test_recovery_never_treats_a_remote_execution_pid_as_dead(self, executions):
+        """A live remote owner is not disproved by a PID lookup on this host."""
+        from cron.jobs import claim_job_for_fire, create_job, get_job
+
+        job = create_job(prompt="x", schedule="every 1m", name="remote-fire-claim")
+        record = executions.create_execution(job["id"], source="external")
+        claimed = claim_job_for_fire(
+            job["id"], return_job=True, execution_id=record["id"]
+        )
+        claim_before = dict(claimed["fire_claim"])
+        with executions._transaction() as conn:
+            conn.execute(
+                "UPDATE executions SET owner_host_id='remote-host', "
+                "process_id='remote-process', pid=?, process_started_at=NULL "
+                "WHERE id=?",
+                (_dead_pid(), record["id"]),
+            )
+
+        assert executions.recover_interrupted_executions() == 0
+        assert executions.latest_execution(job["id"])["status"] == "claimed"
+        assert get_job(job["id"])["fire_claim"] == claim_before
+
+    def test_recovery_does_not_clear_a_replacement_execution_claim(self, executions):
+        """A stale recovery candidate cannot revoke a newer claim by the same job."""
+        import cron.jobs as jobs
+
+        job = jobs.create_job(
+            prompt="x", schedule="every 1m", name="replacement-fire-claim"
+        )
+        record = executions.create_execution(job["id"], source="builtin")
+        claimed = jobs.claim_job_for_fire(
+            job["id"], return_job=True, execution_id=record["id"]
+        )
+        replacement = dict(claimed["fire_claim"])
+        replacement["execution_id"] = "newer-execution"
+        all_jobs = jobs.load_jobs()
+        all_jobs[0]["fire_claim"] = replacement
+        jobs.save_jobs(all_jobs)
+        with executions._transaction() as conn:
+            conn.execute(
+                "UPDATE executions SET process_id='dead-gateway', pid=?, "
+                "process_started_at=NULL WHERE id=?",
+                (_dead_pid(), record["id"]),
+            )
+
+        assert executions.recover_interrupted_executions() == 1
+        assert jobs.get_job(job["id"])["fire_claim"] == replacement
+
+    def test_legacy_recovery_preserves_claim_when_another_execution_is_live(
+        self, executions
+    ):
+        """A legacy claim is ambiguous if any live attempt now owns the job."""
+        from cron.jobs import claim_job_for_fire, create_job, get_job
+
+        job = create_job(prompt="x", schedule="every 1m", name="live-fire-claim")
+        interrupted = executions.create_execution(job["id"], source="builtin")
+        assert claim_job_for_fire(job["id"], return_job=True)
+        live = executions.create_execution(job["id"], source="builtin")
+        executions.mark_execution_running(live["id"])
+        with executions._transaction() as conn:
+            conn.execute(
+                "UPDATE executions SET process_id='dead-gateway', pid=?, "
+                "process_started_at=NULL WHERE id=?",
+                (_dead_pid(), interrupted["id"]),
+            )
+        claim_before = dict(get_job(job["id"])["fire_claim"])
+
+        assert executions.recover_interrupted_executions() == 1
+        assert executions.latest_execution(job["id"])["status"] == "running"
+        assert get_job(job["id"])["fire_claim"] == claim_before
 
     def test_live_owner_claim_is_never_rewritten(self, executions):
         """A claim owned by a live process (this one) must survive the reap."""

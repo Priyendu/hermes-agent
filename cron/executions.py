@@ -7,7 +7,9 @@ proved gone. Terminal states are immutable.
 
 from __future__ import annotations
 
+import logging
 import os
+import socket
 import sqlite3
 import threading
 import uuid
@@ -25,6 +27,18 @@ MAX_TERMINAL_EXECUTIONS = 1000
 _TERMINAL_STATES = ("completed", "failed", "unknown")
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
+logger = logging.getLogger(__name__)
+
+
+def _owner_host_id() -> str:
+    """Stable host identity used to avoid treating remote PIDs as locally dead."""
+    configured = os.getenv("HERMES_MACHINE_ID", "").strip()
+    if configured:
+        return configured
+    try:
+        return socket.gethostname()
+    except Exception:
+        return "unknown"
 
 
 def _connect() -> sqlite3.Connection:
@@ -48,6 +62,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
              job_id TEXT NOT NULL,
              source TEXT NOT NULL,
              process_id TEXT NOT NULL,
+             owner_host_id TEXT,
              pid INTEGER NOT NULL,
              process_started_at INTEGER,
              status TEXT NOT NULL CHECK(status IN
@@ -58,6 +73,11 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
              error TEXT
            )"""
     )
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(executions)").fetchall()
+    }
+    if "owner_host_id" not in columns:
+        conn.execute("ALTER TABLE executions ADD COLUMN owner_host_id TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_job_claimed "
         "ON executions(job_id, claimed_at DESC, id DESC)"
@@ -90,7 +110,12 @@ def _transaction() -> Iterator[sqlite3.Connection]:
 
 
 def _record(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
-    return dict(row) if row is not None else None
+    if row is None:
+        return None
+    record = dict(row)
+    # Internal liveness metadata is not part of the public execution record.
+    record.pop("owner_host_id", None)
+    return record
 
 
 def _emit_execution_state(
@@ -113,7 +138,11 @@ def _process_start_time(pid: int) -> Optional[int]:
         return None
 
 
-def _owner_is_live(pid: int, started_at: Optional[int]) -> bool:
+def _owner_is_live(
+    pid: int, started_at: Optional[int], owner_host_id: Optional[str] = None
+) -> bool:
+    if owner_host_id and owner_host_id != _owner_host_id():
+        return True  # a remote PID cannot be disproved from this host
     try:
         from gateway.status import _pid_exists
         if not _pid_exists(pid):
@@ -146,10 +175,11 @@ def create_execution(job_id: str, *, source: str) -> Dict[str, Any]:
     with _transaction() as conn:
         conn.execute(
             """INSERT INTO executions
-               (id, job_id, source, process_id, pid, process_started_at,
+               (id, job_id, source, process_id, owner_host_id, pid, process_started_at,
                 status, claimed_at)
-               VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?)""",
-            (execution_id, str(job_id), str(source), _PROCESS_ID, pid,
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'claimed', ?)""",
+            (execution_id, str(job_id), str(source), _PROCESS_ID,
+             _owner_host_id(), pid,
              _process_start_time(pid), now),
         )
         row = conn.execute(
@@ -203,19 +233,29 @@ def finish_execution(
 
 
 def recover_interrupted_executions() -> int:
-    """Mark provably abandoned attempts unknown without scheduling retries."""
+    """Mark dead-owner attempts unknown and clear their not-started fire lease.
+
+    Unknown attempts that never reached ``started_at`` have no job-side effects
+    to repeat. Their matching fire lease can therefore be released immediately
+    instead of blocking the next scheduler instance for the full lease TTL.
+    Started attempts remain unknown and keep their lease until normal expiry.
+    """
     now = _hermes_now().isoformat()
     changed = 0
     recovered: List[Dict[str, Any]] = []
+    claim_recovery_candidates: List[Dict[str, Any]] = []
     with _transaction() as conn:
         rows = conn.execute(
-            """SELECT id, process_id, pid, process_started_at FROM executions
+            """SELECT id, job_id, process_id, owner_host_id, pid, process_started_at,
+                      claimed_at, started_at FROM executions
                WHERE status IN ('claimed','running')"""
         ).fetchall()
         for row in rows:
             if row["process_id"] == _PROCESS_ID:
                 continue
-            if _owner_is_live(int(row["pid"]), row["process_started_at"]):
+            if _owner_is_live(
+                int(row["pid"]), row["process_started_at"], row["owner_host_id"]
+            ):
                 continue
             cur = conn.execute(
                 """UPDATE executions SET status='unknown', finished_at=?, error=?
@@ -234,6 +274,40 @@ def recover_interrupted_executions() -> int:
                     recovered.append(record)
         if changed:
             _prune_unlocked(conn)
+
+        # Also revisit eligible unknown rows so a transient jobs.json lock or
+        # write failure does not strand their lease until TTL expiry. Unknown
+        # attempts with started_at set are intentionally excluded: their job
+        # side effects may be uncertain and recovery must not retry them.
+        claim_recovery_candidates = [
+            dict(row)
+            for row in conn.execute(
+                """SELECT id, job_id, owner_host_id, claimed_at, finished_at FROM executions
+                   WHERE status='unknown' AND started_at IS NULL
+                     AND finished_at IS NOT NULL
+                   ORDER BY finished_at DESC LIMIT ?""",
+                (MAX_TERMINAL_EXECUTIONS,),
+            ).fetchall()
+        ]
+
+    from cron.jobs import clear_recovered_fire_claim
+
+    for record in claim_recovery_candidates:
+        try:
+            clear_recovered_fire_claim(
+                record["job_id"],
+                execution_id=record["id"],
+                owner_host_id=record["owner_host_id"],
+                execution_claimed_at=record["claimed_at"],
+                recovery_finished_at=record["finished_at"],
+            )
+        except Exception:
+            logger.warning(
+                "Could not reconcile fire claim for recovered cron execution %s",
+                record["id"],
+                exc_info=True,
+            )
+
     for record in recovered:
         _emit_execution_state(record)
     return changed
@@ -260,7 +334,7 @@ def list_executions(
             + " ORDER BY claimed_at DESC, id DESC LIMIT ?",
             params,
         ).fetchall()
-    return [dict(row) for row in rows]
+    return [record for row in rows if (record := _record(row)) is not None]
 
 
 def latest_execution(job_id: str) -> Optional[Dict[str, Any]]:
@@ -283,4 +357,19 @@ def latest_executions(job_ids: List[str]) -> Dict[str, Dict[str, Any]]:
                             ORDER BY e2.claimed_at DESC, e2.id DESC LIMIT 1)""",
             clean,
         ).fetchall()
-    return {row["job_id"]: dict(row) for row in rows}
+    return {
+        record["job_id"]: record
+        for row in rows
+        if (record := _record(row)) is not None
+    }
+
+
+def has_active_execution(job_id: str) -> bool:
+    """Whether a job currently has a claimed or running owner in the ledger."""
+    with _transaction() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM executions WHERE job_id=? "
+            "AND status IN ('claimed','running') LIMIT 1",
+            (str(job_id),),
+        ).fetchone()
+    return row is not None

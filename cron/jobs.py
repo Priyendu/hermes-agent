@@ -3422,7 +3422,9 @@ def claim_job_for_fire(
     claim_ttl_seconds: int = 300,
     force: bool = False,
     return_job: bool = False,
+    execution_id: Optional[str] = None,
 ) -> Union[bool, Dict[str, Any]]:
+    """Acquire the durable fire lease, optionally linked to its execution row."""
     with _fire_job_lock(job_id) as acquired:
         if not acquired:
             return False
@@ -3431,6 +3433,7 @@ def claim_job_for_fire(
             claim_ttl_seconds=claim_ttl_seconds,
             force=force,
             return_job=return_job,
+            execution_id=execution_id,
         )
 
 
@@ -3440,6 +3443,7 @@ def _claim_job_for_fire_locked(
     claim_ttl_seconds: int = 300,
     force: bool = False,
     return_job: bool = False,
+    execution_id: Optional[str] = None,
 ) -> Union[bool, Dict[str, Any]]:
     """Atomically claim a job for a single external 'fire' (multi-machine
     at-most-once). Returns True iff THIS caller won the claim.
@@ -3458,7 +3462,8 @@ def _claim_job_for_fire_locked(
     re-delivery for the old time can't re-fire). One-shots keep ``next_run_at``
     but the fresh ``fire_claim`` blocks a duplicate retry for the same fire.
     ``mark_job_run`` clears the claim on completion so a re-armed recurring job
-    is claimable again next fire.
+    is claimable again next fire. Runtime callers pass ``execution_id`` so
+    dead-owner recovery can compare-and-clear only the lease for that attempt.
 
     The stale-claim TTL means a machine that crashed after claiming but before
     completing doesn't wedge the job forever — after the TTL another fire can
@@ -3503,6 +3508,8 @@ def _claim_job_for_fire_locked(
             # claim merely because hostname + PID are unchanged.
             owner = f"{_machine_id()}:{uuid.uuid4().hex}"
             job["fire_claim"] = {"at": now.isoformat(), "by": owner}
+            if execution_id:
+                job["fire_claim"]["execution_id"] = str(execution_id)
             kind = job.get("schedule", {}).get("kind")
             if kind in {"cron", "interval"}:
                 nxt = compute_next_run(job["schedule"], now.isoformat())
@@ -3629,6 +3636,75 @@ def _heartbeat_fire_claim_locked(job_id: str, *, expected_owner: str) -> bool:
             claim["at"] = _hermes_now().isoformat()
             save_jobs(jobs)
             return True
+    return False
+
+
+def clear_recovered_fire_claim(
+    job_id: str,
+    *,
+    execution_id: str,
+    owner_host_id: Optional[str],
+    execution_claimed_at: str,
+    recovery_finished_at: str,
+) -> bool:
+    """Clear only a fire lease belonging to a dead, not-started execution.
+
+    New claims carry their execution id, making recovery an exact compare-and-
+    clear. Older persisted claims have no execution id; for those, require the
+    claim timestamp to fall inside the recovered execution's lifetime and
+    recheck under the per-job fire lock that no claimed/running execution now
+    owns the job. Ambiguous or live ownership keeps the lease for normal TTL
+    expiry.
+    """
+    from datetime import datetime
+    from cron.executions import _owner_host_id, has_active_execution
+
+    # The execution reaper can prove process death only on its own host. A
+    # missing host identity is an old/ambiguous record, so preserve its lease.
+    if not owner_host_id or owner_host_id != _owner_host_id():
+        return False
+
+    with _fire_job_lock(job_id) as acquired:
+        if not acquired:
+            return False
+        with _jobs_lock():
+            jobs = load_jobs()
+            for job in jobs:
+                if str(job.get("id")) != str(job_id):
+                    continue
+                claim = job.get("fire_claim")
+                if not isinstance(claim, dict):
+                    return False
+
+                claim_execution_id = claim.get("execution_id")
+                if claim_execution_id is not None:
+                    if str(claim_execution_id) != str(execution_id):
+                        return False
+                else:
+                    # Legacy leases cannot be matched by id. Only clear when
+                    # their timestamp is within this exact not-started
+                    # execution window and no live execution remains. A live
+                    # claimant persists its execution row before it attempts
+                    # the fire-claim CAS.
+                    try:
+                        claim_at = _ensure_aware(datetime.fromisoformat(claim["at"]))
+                        started_at = _ensure_aware(
+                            datetime.fromisoformat(execution_claimed_at)
+                        )
+                        recovered_at = _ensure_aware(
+                            datetime.fromisoformat(recovery_finished_at)
+                        )
+                    except (KeyError, TypeError, ValueError):
+                        return False
+                    if not started_at <= claim_at <= recovered_at:
+                        return False
+
+                    if has_active_execution(job_id):
+                        return False
+
+                job["fire_claim"] = None
+                save_jobs(jobs)
+                return True
     return False
 
 
