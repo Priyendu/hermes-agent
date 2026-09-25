@@ -925,11 +925,11 @@ def _execute_job_now(
 ) -> Dict[str, Any]:
     """Execute a cron job immediately, outside the scheduler tick.
 
-    Atomically claims the job first via ``claim_job_for_fire`` — the same
-    at-most-once CAS the scheduler/external-provider fire path uses — so a
-    concurrently-running gateway ticker cannot also fire it (the claim both
-    blocks a duplicate fire and advances ``next_run_at`` for recurring jobs).
-    If the claim is lost (another fire is in flight), this is a no-op.
+    Reserves the scheduler's shared running slot before taking the durable
+    ``claim_job_for_fire`` CAS. This prevents a due worker from registering in
+    the manual claim-to-start gap; the durable claim still blocks fires from
+    other processes and advances ``next_run_at`` for recurring jobs. If either
+    reservation is lost, this is a no-op.
 
     The actual firing is delegated to ``run_one_job`` — the single shared
     execute→save→deliver→mark body the ticker and external providers use — so
@@ -964,11 +964,14 @@ def _execute_job_now(
             pass
         return {"claimed": True, "success": False, "error": str(e)}
 
-    return _run_claimed_job(claimed_job, extra_prompt=extra_prompt)
+    return _run_claimed_job(
+        claimed_job, extra_prompt=extra_prompt, pre_registered=True,
+    )
 
 
 def _run_claimed_job(
-    job: Dict[str, Any], extra_prompt: Optional[str] = None
+    job: Dict[str, Any], extra_prompt: Optional[str] = None, *,
+    pre_registered: bool = False,
 ) -> Dict[str, Any]:
     """Fire an already-claimed job through the shared ``run_one_job`` body.
 
@@ -980,7 +983,7 @@ def _run_claimed_job(
     Returns {"claimed": True, "success": bool, "error": str|None}.
     """
     job_id = job["id"]
-    _registered = False
+    _registered = pre_registered
     fire_owner = None
     try:
         from cron.scheduler import (
@@ -998,7 +1001,12 @@ def _run_claimed_job(
         # (get_running_job_ids, #60432) and mark_running_jobs_interrupted.
         claim = job.get("fire_claim")
         fire_owner = str(claim.get("by") or "") if isinstance(claim, dict) else None
-        if not try_register_running_job(job_id):
+        if pre_registered:
+            # Manual paths reserve the process-local running slot BEFORE the
+            # durable fire claim. That ordering prevents the scheduler worker
+            # from registering between our claim and run-start handoff.
+            _registered = True
+        elif not try_register_running_job(job_id):
             error = (
                 "Job is already running (a scheduler tick or another manual "
                 "run is executing it); not started again."
@@ -1138,31 +1146,43 @@ def _run_claimed_job(
 
 
 def _claim_manual_execution(job_id: str):
-    """Create an execution row before taking a manual fire lease.
+    """Reserve the running slot, then create and claim a manual execution.
 
-    Linking the CAS claim to its execution row closes the crash window between
-    claim acquisition and ``run_one_job`` startup. If the lease is not acquired,
-    terminate the unused row so it cannot be mistaken for an interrupted run.
+    Registration precedes the durable fire-claim CAS so a scheduler worker
+    cannot register in the gap between manual claim acquisition and run start.
+    The execution row is then created before the CAS so recovery can link the
+    lease to its attempt. If the CAS loses or any setup step fails, terminate
+    the unused row and release the running slot.
     """
+    from cron.scheduler import release_running_job, try_register_running_job
     from cron.executions import create_execution, finish_execution
 
-    execution = create_execution(job_id, source="manual")
-    execution_id = execution["id"]
+    if not try_register_running_job(job_id):
+        return False
+    execution_id = None
+    claimed = None
     try:
+        execution = create_execution(job_id, source="manual")
+        execution_id = execution["id"]
         claimed = claim_job_for_fire(
             job_id, return_job=True, execution_id=execution_id,
         )
+        if not isinstance(claimed, dict):
+            finish_execution(
+                execution_id, success=False,
+                error="manual fire claim not acquired",
+            )
+            return claimed
+        return {**claimed, "execution_id": execution_id}
     except Exception:
-        finish_execution(
-            execution_id, success=False, error="manual fire claim failed",
-        )
+        if execution_id is not None:
+            finish_execution(
+                execution_id, success=False, error="manual fire claim failed",
+            )
         raise
-    if not isinstance(claimed, dict):
-        finish_execution(
-            execution_id, success=False, error="manual fire claim not acquired",
-        )
-        return claimed
-    return {**claimed, "execution_id": execution_id}
+    finally:
+        if not isinstance(claimed, dict):
+            release_running_job(job_id)
 
 
 def _finalize_unstarted_manual_claim(job: Dict[str, Any], error: str) -> None:
@@ -1315,8 +1335,8 @@ def _try_dispatch_background_run(
     try:
         # Best-effort early dedupe so a mid-run job reports in THIS tool
         # response instead of as a delayed error completion event. The
-        # authoritative (atomic) check is try_register_running_job inside
-        # _run_claimed_job on the worker.
+        # authoritative reservation occurs in _claim_manual_execution before
+        # the durable fire claim, and is held through the worker run.
         try:
             from cron.scheduler import get_running_job_ids
 
@@ -1372,7 +1392,9 @@ def _try_dispatch_background_run(
             "cronjob run: async delegation registry unavailable (%s); "
             "running job '%s' inline.", e, job_name,
         )
-        result = _run_claimed_job(claimed_job, extra_prompt=extra_prompt)
+        result = _run_claimed_job(
+            claimed_job, extra_prompt=extra_prompt, pre_registered=True,
+        )
         result["dispatched"] = False
         return result
 
@@ -1387,7 +1409,9 @@ def _try_dispatch_background_run(
     deliver = job.get("deliver", "local")
 
     def _runner() -> Dict[str, Any]:
-        res = _run_claimed_job(claimed_job, extra_prompt=extra_prompt)
+        res = _run_claimed_job(
+            claimed_job, extra_prompt=extra_prompt, pre_registered=True,
+        )
         duration = round(time.time() - started_at, 2)
         refreshed = get_job(job_id) or {}
         lines = [
@@ -1445,7 +1469,9 @@ def _try_dispatch_background_run(
         "cronjob run: background pool unavailable (%s); running job '%s' inline.",
         dispatch.get("error", "rejected"), job_name,
     )
-    result = _run_claimed_job(claimed_job, extra_prompt=extra_prompt)
+    result = _run_claimed_job(
+        claimed_job, extra_prompt=extra_prompt, pre_registered=True,
+    )
     result["dispatched"] = False
     return result
 

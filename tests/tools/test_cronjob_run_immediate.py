@@ -62,12 +62,17 @@ class TestCronjobRunExecutesImmediately:
             "job-run-1", execution_id="manual-exec", expected_owner="manual-owner",
         )
 
-    def test_manual_claim_creates_execution_and_links_before_claim(self):
+    def test_manual_claim_registers_before_execution_and_fire_claim(self):
         from tools.cronjob_tools import _claim_manual_execution
 
         order = []
         claimed = {**_JOB, "fire_claim": {"by": "manual-owner"}}
-        with patch("cron.executions.create_execution",
+        with patch("cron.scheduler.try_register_running_job",
+                   side_effect=lambda job_id: (
+                       order.append(("register", job_id)) or True
+                   )), \
+             patch("cron.scheduler.release_running_job"), \
+             patch("cron.executions.create_execution",
                    side_effect=lambda job_id, source: (
                        order.append(("execution", job_id, source))
                        or {"id": "manual-exec"}
@@ -80,6 +85,7 @@ class TestCronjobRunExecutesImmediately:
             result = _claim_manual_execution("job-run-1")
 
         assert order == [
+            ("register", "job-run-1"),
             ("execution", "job-run-1", "manual"),
             ("claim", "job-run-1", "manual-exec"),
         ]
@@ -87,6 +93,58 @@ class TestCronjobRunExecutesImmediately:
         m_claim.assert_called_once_with(
             "job-run-1", return_job=True, execution_id="manual-exec",
         )
+
+    def test_manual_registration_closes_scheduler_claim_handoff_race(self):
+        from cron.scheduler import get_running_job_ids, try_register_running_job
+        from tools.cronjob_tools import _claim_manual_execution, _run_claimed_job
+
+        job_id = "manual-scheduler-race"
+        observed = {}
+
+        def scheduler_claim(*_args, **_kwargs):
+            # Simulate the due worker reaching its shared running-set guard
+            # between the manual registration and durable fire-claim CAS.
+            observed["scheduler_registered"] = try_register_running_job(job_id)
+            return {
+                **_JOB,
+                "id": job_id,
+                "fire_claim": {
+                    "by": "manual-owner", "execution_id": "manual-exec",
+                },
+            }
+
+        def run_one_job(job, **_kwargs):
+            observed["registered_during_run"] = (
+                job_id in get_running_job_ids()
+            )
+            return True
+
+        with patch("cron.executions.create_execution",
+                   return_value={"id": "manual-exec"}), \
+             patch("tools.cronjob_tools.claim_job_for_fire",
+                   side_effect=scheduler_claim), \
+             patch("cron.scheduler.run_one_job", side_effect=run_one_job), \
+             patch("tools.cronjob_tools.get_job",
+                   return_value={"last_status": "ok", "last_error": None}):
+            claimed = _claim_manual_execution(job_id)
+            result = _run_claimed_job(claimed, pre_registered=True)
+
+        assert observed["scheduler_registered"] is False
+        assert observed["registered_during_run"] is True
+        assert result["success"] is True
+        assert job_id not in get_running_job_ids()
+
+    def test_manual_claim_does_not_create_execution_when_running_slot_is_taken(self):
+        from tools.cronjob_tools import _claim_manual_execution
+
+        with patch("cron.scheduler.try_register_running_job", return_value=False), \
+             patch("cron.executions.create_execution") as create, \
+             patch("tools.cronjob_tools.claim_job_for_fire") as claim:
+            result = _claim_manual_execution("job-run-1")
+
+        assert result is False
+        create.assert_not_called()
+        claim.assert_not_called()
 
     def test_manual_claim_without_lease_terminates_unused_execution(self):
         from tools.cronjob_tools import _claim_manual_execution
