@@ -3754,20 +3754,23 @@ def clear_recovered_fire_claim(
     execution_claimed_at: str,
     recovery_finished_at: str,
 ) -> bool:
-    """Clear only claims belonging to a dead, not-started execution.
+    """Clear only claims belonging to an execution already proved dead.
 
     New fire and one-shot run claims carry their execution id, making recovery
     an exact compare-and-clear. Older fire claims have no execution id; for
     those, require the claim timestamp to fall inside the recovered execution's
     lifetime and recheck that no active execution now owns the job. Legacy
-    one-shot run claims without an execution id remain until their TTL.
+    one-shot run claims are stamped just before the execution row, so compare
+    their timestamp against the bounded pre-claim window instead.
     """
-    from datetime import datetime
-    from cron.executions import _owner_host_id, has_active_execution
+    from datetime import datetime, timedelta
+    from cron.executions import has_active_execution
 
-    # The execution reaper can prove process death only on its own host. A
-    # missing host identity is an old/ambiguous record, so preserve its lease.
-    if not owner_host_id or owner_host_id != _owner_host_id():
+    ttl = _oneshot_run_claim_ttl_seconds()
+    try:
+        claimed_at = _ensure_aware(datetime.fromisoformat(execution_claimed_at))
+        recovered_at = _ensure_aware(datetime.fromisoformat(recovery_finished_at))
+    except (TypeError, ValueError):
         return False
 
     with _fire_job_lock(job_id) as acquired:
@@ -3794,29 +3797,35 @@ def clear_recovered_fire_claim(
                             claim_at = _ensure_aware(
                                 datetime.fromisoformat(fire_claim["at"])
                             )
-                            started_at = _ensure_aware(
-                                datetime.fromisoformat(execution_claimed_at)
-                            )
-                            recovered_at = _ensure_aware(
-                                datetime.fromisoformat(recovery_finished_at)
-                            )
                         except (KeyError, TypeError, ValueError):
-                            claim_at = started_at = recovered_at = None
+                            claim_at = None
                         if (claim_at is not None
-                                and started_at is not None
-                                and recovered_at is not None
-                                and started_at <= claim_at <= recovered_at
+                                and claimed_at <= claim_at <= recovered_at
                                 and not has_active_execution(job_id)):
                             job["fire_claim"] = None
                             changed = True
 
                 run_claim = job.get("run_claim")
                 if (job.get("schedule", {}).get("kind") == "once"
-                        and isinstance(run_claim, dict)
-                        and str(run_claim.get("execution_id") or "")
-                        == str(execution_id)):
-                    job["run_claim"] = None
-                    changed = True
+                        and isinstance(run_claim, dict)):
+                    run_claim_execution_id = run_claim.get("execution_id")
+                    if run_claim_execution_id is not None:
+                        if str(run_claim_execution_id) == str(execution_id):
+                            job["run_claim"] = None
+                            changed = True
+                    else:
+                        try:
+                            run_claim_at = _ensure_aware(
+                                datetime.fromisoformat(run_claim["at"])
+                            )
+                        except (KeyError, TypeError, ValueError):
+                            run_claim_at = None
+                        if (run_claim_at is not None
+                                and claimed_at - timedelta(seconds=ttl)
+                                <= run_claim_at <= recovered_at
+                                and not has_active_execution(job_id)):
+                            job["run_claim"] = None
+                            changed = True
 
                 if not changed:
                     return False

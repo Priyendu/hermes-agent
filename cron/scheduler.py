@@ -7182,7 +7182,16 @@ def _run_one_job_body(
 
         # The attempt is claimed durably before executor/provider dispatch and
         # becomes running only immediately before the actual run.
-        mark_execution_running(execution_id)
+        running_execution = mark_execution_running(execution_id)
+        if running_execution is None:
+            # Recovery or another terminal transition won the CAS after this
+            # worker acquired its snapshot. Never cross into agent/provider
+            # side effects when the durable attempt is no longer claimed.
+            logger.warning(
+                "Job '%s' not started: execution %s is no longer claimed",
+                job.get("name", job["id"]), execution_id,
+            )
+            return True
 
         # Run the job under the profile's secret scope. get_secret() fails
         # closed outside a scope once profile isolation is in play (multiple

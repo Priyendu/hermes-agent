@@ -104,6 +104,27 @@ class TestDispatchFailurePathsClearClaim:
         assert reloaded.get("run_claim") is None
         assert job["id"] not in sched.get_running_job_ids()
 
+    def test_dispatch_failure_does_not_clear_replacement_claim_execution_id(
+        self, cron_store
+    ):
+        """M11: stale dispatch cleanup is fenced by execution identity."""
+        from cron import scheduler as sched
+
+        snapshot = _make_oneshot(claimed=True)
+        original_claim = dict(snapshot["run_claim"], execution_id="old-execution")
+        snapshot["run_claim"] = dict(original_claim)
+        replacement = dict(original_claim, execution_id="replacement-execution")
+        all_jobs = jobs_mod.load_jobs()
+        persisted = next(row for row in all_jobs if row["id"] == snapshot["id"])
+        persisted["run_claim"] = replacement
+        jobs_mod.save_jobs(all_jobs)
+
+        with patch.object(sched, "_interpreter_shutting_down", return_value=True):
+            self._tick_one(snapshot)
+
+        reloaded = jobs_mod.get_job(snapshot["id"])
+        assert reloaded["run_claim"] == replacement
+
     def test_submit_failure_clears_claim(self, cron_store):
         from cron import scheduler as sched
         job = _make_oneshot(claimed=True)

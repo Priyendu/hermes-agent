@@ -34,7 +34,7 @@ def executions(monkeypatch, tmp_path):
     import cron.executions as executions_mod
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
-    monkeypatch.setenv("HERMES_MACHINE_ID", "test-stable-host")
+    monkeypatch.delenv("HERMES_MACHINE_ID", raising=False)
     monkeypatch.setattr(
         executions_mod, "EXECUTIONS_FILE", tmp_path / "cron" / "executions.db"
     )
@@ -173,6 +173,85 @@ class TestTickReapsDeadOwnerClaims:
         assert recovered["fire_claim"] is None
         assert recovered["run_claim"] is None
 
+    def test_recovery_clears_legacy_oneshot_claim_inside_bounded_time_window(
+        self, executions
+    ):
+        """M6: exercise the no-execution-ID legacy run-claim time window."""
+        from datetime import datetime, timedelta
+        import cron.jobs as jobs
+
+        job = jobs.create_job(
+            prompt="x", schedule="in 30m", name="legacy-once-window"
+        )
+        record = executions.create_execution(job["id"], source="builtin")
+        with executions._transaction() as conn:
+            claimed_at = conn.execute(
+                "SELECT claimed_at FROM executions WHERE id=?",
+                (record["id"],),
+            ).fetchone()["claimed_at"]
+        legacy_at = (
+            datetime.fromisoformat(claimed_at) - timedelta(seconds=5)
+        ).isoformat()
+        all_jobs = jobs.load_jobs()
+        persisted = next(row for row in all_jobs if row["id"] == job["id"])
+        persisted["run_claim"] = {"at": legacy_at, "by": "legacy-runner"}
+        jobs.save_jobs(all_jobs)
+        jobs.claim_job_for_fire(
+            job["id"], return_job=True, execution_id=record["id"]
+        )
+
+        with executions._transaction() as conn:
+            conn.execute(
+                "UPDATE executions SET process_id='dead-once', pid=?, "
+                "process_started_at=NULL WHERE id=?",
+                (_dead_pid(), record["id"]),
+            )
+
+        assert executions.recover_interrupted_executions() == 1
+        recovered = jobs.get_job(job["id"])
+        assert recovered["fire_claim"] is None
+        assert recovered["run_claim"] is None
+
+    def test_recovery_preserves_replacement_oneshot_claim_execution_id(
+        self, executions
+    ):
+        """M9: recovery must not clear a replacement one-shot execution."""
+        import cron.jobs as jobs
+
+        job = jobs.create_job(
+            prompt="x", schedule="in 30m", name="replacement-once-run-claim"
+        )
+        dead = executions.create_execution(job["id"], source="builtin")
+        replacement = executions.create_execution(job["id"], source="builtin")
+        executions.mark_execution_running(replacement["id"])
+        replacement_fire_claim = {
+            "at": "2026-09-27T00:00:00+00:00",
+            "by": "replacement-dispatcher",
+            "execution_id": replacement["id"],
+        }
+        replacement_run_claim = dict(replacement_fire_claim)
+        all_jobs = jobs.load_jobs()
+        persisted = next(row for row in all_jobs if row["id"] == job["id"])
+        persisted["fire_claim"] = replacement_fire_claim
+        persisted["run_claim"] = replacement_run_claim
+        jobs.save_jobs(all_jobs)
+        with executions._transaction() as conn:
+            conn.execute(
+                "UPDATE executions SET process_id='dead-old-once', pid=?, "
+                "process_started_at=NULL WHERE id=?",
+                (_dead_pid(), dead["id"]),
+            )
+
+        assert executions.recover_interrupted_executions() == 1
+        recovered = jobs.get_job(job["id"])
+        assert recovered["fire_claim"] == replacement_fire_claim
+        assert recovered["run_claim"] == replacement_run_claim
+        replacement_row = next(
+            row for row in executions.list_executions(job_id=job["id"])
+            if row["id"] == replacement["id"]
+        )
+        assert replacement_row["status"] == "running"
+
     def test_recovery_clears_matching_legacy_claim_only_without_live_owner(
         self, executions
     ):
@@ -193,10 +272,65 @@ class TestTickReapsDeadOwnerClaims:
         assert executions.recover_interrupted_executions() == 1
         assert get_job(job["id"])["fire_claim"] is None
 
-    def test_recovery_preserves_fire_claim_for_started_dead_execution(
+    def test_recovery_reconciles_claim_before_retention_prunes_execution(
+        self, executions, monkeypatch
+    ):
+        """A newly recovered row must be captured before terminal-row pruning."""
+        import cron.executions as ledger
+        import cron.jobs as jobs
+
+        job = jobs.create_job(
+            prompt="x", schedule="every 1m", name="prune-after-recovery"
+        )
+        record = executions.create_execution(job["id"], source="builtin")
+        jobs.claim_job_for_fire(job["id"], return_job=True, execution_id=record["id"])
+        with executions._transaction() as conn:
+            conn.execute(
+                "UPDATE executions SET process_id='dead-prune-owner', pid=?, "
+                "process_started_at=NULL WHERE id=?",
+                (_dead_pid(), record["id"]),
+            )
+            for index in range(2):
+                conn.execute(
+                    """INSERT INTO executions
+                       (id, job_id, source, process_id, owner_host_id, pid,
+                        process_started_at, status, claimed_at, finished_at, error)
+                       VALUES (?, ?, 'test', 'terminal', NULL, 1, NULL,
+                               'completed', '2099-01-01T00:00:00+00:00',
+                               '2099-01-01T00:00:00+00:00', NULL)""",
+                    (f"newer-terminal-{index}", job["id"]),
+                )
+        monkeypatch.setattr(ledger, "MAX_TERMINAL_EXECUTIONS", 1)
+
+        assert executions.recover_interrupted_executions() == 1
+        assert jobs.get_job(job["id"])["fire_claim"] is None
+        with executions._transaction() as conn:
+            assert conn.execute(
+                "SELECT 1 FROM executions WHERE id=?", (record["id"],)
+            ).fetchone() is None
+
+    def test_recovery_does_not_rescan_expired_unknown_history(self, executions):
+        """Old unknown rows must not force a jobs.json read on every reaper."""
+        record = executions.create_execution("old-unknown", source="builtin")
+        with executions._transaction() as conn:
+            conn.execute(
+                "UPDATE executions SET status='unknown', finished_at=?, error=? "
+                "WHERE id=?",
+                (
+                    "2000-01-01T00:00:00+00:00",
+                    "Scheduler restarted after this execution's owner exited.",
+                    record["id"],
+                ),
+            )
+
+        with patch("cron.jobs.clear_recovered_fire_claim") as clear_claim:
+            assert executions.recover_interrupted_executions() == 0
+        clear_claim.assert_not_called()
+
+    def test_recovery_clears_fire_claim_for_started_dead_execution(
         self, executions
     ):
-        """Unknown side effects stay protected by the normal fire-claim TTL."""
+        """A dead recurring owner releases its lease even after side effects began."""
         from cron.jobs import claim_job_for_fire, create_job, get_job
 
         job = create_job(prompt="x", schedule="every 1m", name="started-fire-claim")
@@ -215,7 +349,12 @@ class TestTickReapsDeadOwnerClaims:
 
         assert executions.recover_interrupted_executions() == 1
         assert executions.latest_execution(job["id"])["status"] == "unknown"
-        assert get_job(job["id"])["fire_claim"] == claim_before
+        assert get_job(job["id"])["fire_claim"] is None
+        retry_execution = executions.create_execution(job["id"], source="builtin")
+        retry = claim_job_for_fire(
+            job["id"], return_job=True, execution_id=retry_execution["id"]
+        )
+        assert retry["fire_claim"]["execution_id"] != claim_before["execution_id"]
 
     def test_recovery_never_treats_a_remote_execution_pid_as_dead(self, executions):
         """A live remote owner is not disproved by a PID lookup on this host."""
@@ -239,10 +378,8 @@ class TestTickReapsDeadOwnerClaims:
         assert executions.latest_execution(job["id"])["status"] == "claimed"
         assert get_job(job["id"])["fire_claim"] == claim_before
 
-    def test_missing_owner_host_id_preserves_claim_even_when_pid_is_absent(
-        self, executions
-    ):
-        """Pre-migration rows have no proof that their PID is local."""
+    def test_missing_owner_host_id_keeps_legacy_pid_recovery(self, executions):
+        """Pre-migration rows retain the legacy dead-PID recovery path."""
         from cron.jobs import claim_job_for_fire, create_job, get_job
 
         job = create_job(prompt="x", schedule="every 1m", name="unknown-host-claim")
@@ -258,14 +395,57 @@ class TestTickReapsDeadOwnerClaims:
                 ("legacy-owner", _dead_pid(), record["id"]),
             )
 
-        assert executions.recover_interrupted_executions() == 0
-        assert executions.latest_execution(job["id"])["status"] == "claimed"
-        assert get_job(job["id"])["fire_claim"] == claim_before
+        assert executions.recover_interrupted_executions() == 1
+        assert executions.latest_execution(job["id"])["status"] == "unknown"
+        assert get_job(job["id"])["fire_claim"] is None
+
+    def test_production_no_identity_ephemeral_hostname_reclaims_dead_owner(
+        self, executions, monkeypatch
+    ):
+        """M4: production's Docker hostname/no machine ID still recovers by PID."""
+        from cron.jobs import claim_job_for_fire, create_job, get_job
+
+        monkeypatch.delenv("HERMES_MACHINE_ID", raising=False)
+        monkeypatch.setattr(executions.socket, "gethostname", lambda: "0c931814b3f4")
+        with patch(
+            "hermes_cli.config.load_config_readonly",
+            return_value={"cron": {}},
+        ):
+            job = create_job(
+                prompt="x", schedule="every 1m", name="production-no-identity"
+            )
+            record = executions.create_execution(job["id"], source="builtin")
+            claimed = claim_job_for_fire(
+                job["id"], return_job=True, execution_id=record["id"]
+            )
+            assert claimed["fire_claim"]["execution_id"] == record["id"]
+            with executions._transaction() as conn:
+                owner = conn.execute(
+                    "SELECT owner_host_id FROM executions WHERE id=?",
+                    (record["id"],),
+                ).fetchone()["owner_host_id"]
+                conn.execute(
+                    "UPDATE executions SET process_id='dead-production-owner', pid=?, "
+                    "process_started_at=NULL WHERE id=?",
+                    (_dead_pid(), record["id"]),
+                )
+
+            assert owner is None
+            assert executions.recover_interrupted_executions() == 1
+            assert executions.latest_execution(job["id"])["status"] == "unknown"
+            assert get_job(job["id"])["fire_claim"] is None
+            retry_execution = executions.create_execution(
+                job["id"], source="builtin"
+            )
+            retry = claim_job_for_fire(
+                job["id"], return_job=True, execution_id=retry_execution["id"]
+            )
+            assert retry["fire_claim"]["execution_id"] != record["id"]
 
     def test_owner_host_id_requires_stable_configured_identity(
         self, executions, monkeypatch
     ):
-        monkeypatch.delenv("HERMES_MACHINE_ID")
+        monkeypatch.delenv("HERMES_MACHINE_ID", raising=False)
         monkeypatch.setattr(executions.socket, "gethostname", lambda: "0123456789ab")
         assert executions._owner_host_id() is None
 

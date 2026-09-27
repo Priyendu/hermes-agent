@@ -14,6 +14,7 @@ import sqlite3
 import threading
 import uuid
 from contextlib import contextmanager
+from datetime import timedelta
 from typing import Any, Dict, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
@@ -187,10 +188,14 @@ def _owner_is_live(
     pid: int, started_at: Optional[int], owner_host_id: Optional[str] = None
 ) -> bool:
     current_host_id = _owner_host_id()
-    if not owner_host_id or not current_host_id:
-        return True  # missing identity cannot prove this PID belongs to us
-    if owner_host_id != current_host_id:
+    if owner_host_id and current_host_id and owner_host_id != current_host_id:
         return True  # a remote PID cannot be disproved from this host
+
+    # Preserve the pre-identity PID recovery when either side lacks the newer
+    # host marker. Production historically ran with an ephemeral Docker
+    # hostname and no HERMES_MACHINE_ID; refusing all such rows strands the
+    # very claims this reaper exists to recover. PID/start-time checks remain
+    # the authority in this compatibility case.
     try:
         from gateway.status import _pid_exists
         if not _pid_exists(pid):
@@ -200,7 +205,11 @@ def _owner_is_live(
     if started_at is None:
         return pid == os.getpid()
     current = _process_start_time(pid)
-    return current is not None and current == started_at
+    if current is None:
+        # Failure to read process start time is not evidence that a matching
+        # PID is dead; preserve the claim and retry on a later reap.
+        return True
+    return current == started_at
 
 
 def _prune_unlocked(conn: sqlite3.Connection) -> None:
@@ -281,17 +290,24 @@ def finish_execution(
 
 
 def recover_interrupted_executions() -> int:
-    """Mark dead-owner attempts unknown and clear their not-started fire lease.
+    """Mark proven-dead attempts unknown and reconcile only their exact leases.
 
-    Unknown attempts that never reached ``started_at`` have no job-side effects
-    to repeat. Their matching fire lease can therefore be released immediately
-    instead of blocking the next scheduler instance for the full lease TTL.
-    Started attempts remain unknown and keep their lease until normal expiry.
+    A recurring job's next fire is already advanced at claim time, so a dead
+    owner may release its lease whether it died before or during execution.
+    One-shot dispatch remains protected by ``claim_dispatch``. Reconciliation
+    retries are bounded to recently recovered rows so old unknown history does
+    not trigger a jobs.json scan on every reap.
     """
     now = _hermes_now().isoformat()
     changed = 0
     recovered: List[Dict[str, Any]] = []
     claim_recovery_candidates: List[Dict[str, Any]] = []
+    from cron.jobs import _oneshot_run_claim_ttl_seconds
+
+    cutoff = (
+        _hermes_now()
+        - timedelta(seconds=max(1.0, _oneshot_run_claim_ttl_seconds()))
+    ).isoformat()
     with _transaction() as conn:
         rows = conn.execute(
             """SELECT id, job_id, process_id, owner_host_id, pid, process_started_at,
@@ -320,23 +336,25 @@ def recover_interrupted_executions() -> int:
                 ).fetchone())
                 if record is not None:
                     recovered.append(record)
-        if changed:
-            _prune_unlocked(conn)
-
-        # Also revisit eligible unknown rows so a transient jobs.json lock or
-        # write failure does not strand their lease until TTL expiry. Unknown
-        # attempts with started_at set are intentionally excluded: their job
-        # side effects may be uncertain and recovery must not retry them.
+        # Revisit only recent unknown rows produced by this recovery path, so a
+        # transient jobs.json lock/write failure can be retried without
+        # scanning the entire historical execution ledger on every tick.
         claim_recovery_candidates = [
             dict(row)
             for row in conn.execute(
-                """SELECT id, job_id, owner_host_id, claimed_at, finished_at FROM executions
-                   WHERE status='unknown' AND started_at IS NULL
-                     AND finished_at IS NOT NULL
+                """SELECT id, job_id, owner_host_id, claimed_at, finished_at
+                   FROM executions
+                   WHERE status='unknown' AND finished_at >= ?
+                     AND error LIKE 'Scheduler restarted after this execution%'
                    ORDER BY finished_at DESC LIMIT ?""",
-                (MAX_TERMINAL_EXECUTIONS,),
+                (cutoff, MAX_TERMINAL_EXECUTIONS),
             ).fetchall()
         ]
+        # Capture claim candidates before pruning. The execution retention cap
+        # must not erase the just-recovered ledger row before its matching
+        # durable lease has had a chance to be reconciled.
+        if changed:
+            _prune_unlocked(conn)
 
     from cron.jobs import clear_recovered_fire_claim
 

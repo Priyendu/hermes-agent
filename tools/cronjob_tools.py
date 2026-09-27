@@ -958,10 +958,9 @@ def _execute_job_now(
             return {"claimed": False, "success": False, "error": reason}
     except Exception as e:
         logger.error("Failed to claim cron job %s for immediate run: %s", job_id, e)
-        try:
-            mark_job_run(job_id, False, str(e))
-        except Exception:
-            pass
+        # Claim setup did not return an owner-bearing snapshot. Do not mutate
+        # jobs.json here: mark_job_run without expected_fire_owner could erase
+        # a replacement scheduler/manual claim after our failed attempt.
         return {"claimed": True, "success": False, "error": str(e)}
 
     return _run_claimed_job(
@@ -1379,10 +1378,8 @@ def _try_dispatch_background_run(
             return {"claimed": False, "success": False, "error": reason}
     except Exception as e:
         logger.error("Failed to claim cron job %s for background run: %s", job_id, e)
-        try:
-            mark_job_run(job_id, False, str(e))
-        except Exception:
-            pass
+        # As above, an exception before an owner-bearing claim snapshot gives
+        # this path no authority to complete or clear the durable fire claim.
         return {"claimed": True, "dispatched": False, "success": False, "error": str(e)}
 
     origin_ui_session_id = ""
