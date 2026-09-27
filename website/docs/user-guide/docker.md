@@ -393,8 +393,11 @@ single-machine deployment whose hostname is ephemeral, configure
 `cron.machine_id` in that profile's `config.yaml` as a stable fallback; a
 stable service hostname takes precedence over this profile-level value. Never
 reuse an identity across concurrently active PID namespaces sharing an
-execution ledger. Without a stable identity, ambiguous execution rows are
-preserved rather than reaped using an unverified PID.
+execution ledger. A row with missing identity is preserved whenever the
+reaper does have an identity, because its PID cannot be checked from a known
+different namespace. If neither the row nor reaper has an identity, legacy
+PID recovery is retained for single-namespace deployments; do not use that
+fallback when multiple PID namespaces share an execution ledger.
 
 ## Optional: Linux desktop audio bridge
 

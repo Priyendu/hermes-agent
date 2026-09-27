@@ -378,10 +378,13 @@ class TestTickReapsDeadOwnerClaims:
         assert executions.latest_execution(job["id"])["status"] == "claimed"
         assert get_job(job["id"])["fire_claim"] == claim_before
 
-    def test_missing_owner_host_id_keeps_legacy_pid_recovery(self, executions):
-        """Pre-migration rows retain the legacy dead-PID recovery path."""
+    def test_missing_owner_host_id_keeps_legacy_pid_recovery_when_both_unidentified(
+        self, executions, monkeypatch
+    ):
+        """The historical single-namespace, no-identity case still recovers."""
         from cron.jobs import claim_job_for_fire, create_job, get_job
 
+        monkeypatch.setattr(executions, "_owner_host_id", lambda: None)
         job = create_job(prompt="x", schedule="every 1m", name="unknown-host-claim")
         record = executions.create_execution(job["id"], source="builtin")
         claimed = claim_job_for_fire(
@@ -398,6 +401,34 @@ class TestTickReapsDeadOwnerClaims:
         assert executions.recover_interrupted_executions() == 1
         assert executions.latest_execution(job["id"])["status"] == "unknown"
         assert get_job(job["id"])["fire_claim"] is None
+
+    def test_missing_owner_host_id_is_preserved_by_identified_dashboard(
+        self, executions, monkeypatch
+    ):
+        """A local PID miss cannot prove a migrated gateway owner is dead."""
+        from cron.jobs import claim_job_for_fire, create_job, get_job
+
+        monkeypatch.setattr(
+            executions, "_owner_host_id", lambda: "hermes-dashboard"
+        )
+        job = create_job(prompt="x", schedule="every 1m", name="legacy-gateway")
+        record = executions.create_execution(job["id"], source="builtin")
+        claimed = claim_job_for_fire(
+            job["id"], return_job=True, execution_id=record["id"]
+        )
+        claim_before = dict(claimed["fire_claim"])
+        with executions._transaction() as conn:
+            conn.execute(
+                "UPDATE executions SET owner_host_id=NULL, process_id=?, pid=?, "
+                "process_started_at=NULL WHERE id=?",
+                ("legacy-gateway", _dead_pid(), record["id"]),
+            )
+
+        with patch("gateway.status._pid_exists", return_value=False):
+            assert executions.recover_interrupted_executions() == 0
+
+        assert executions.latest_execution(job["id"])["status"] == "claimed"
+        assert get_job(job["id"])["fire_claim"] == claim_before
 
     def test_production_no_identity_ephemeral_hostname_reclaims_dead_owner(
         self, executions, monkeypatch

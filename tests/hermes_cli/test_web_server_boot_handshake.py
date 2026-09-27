@@ -120,6 +120,51 @@ def test_cron_recovery_visits_every_dashboard_profile(tmp_path):
     ]
 
 
+def test_dashboard_recovery_preserves_legacy_gateway_claim_from_other_namespace(
+        tmp_path, monkeypatch):
+    """The real dashboard recovery helper must not reap an unowned foreign PID."""
+    import cron.executions as executions
+    import cron.jobs as jobs
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    home = tmp_path / "default"
+    token = set_hermes_home_override(home)
+    try:
+        with jobs.use_cron_store(home):
+            job = jobs.create_job(
+                prompt="x", schedule="every 1m", name="legacy-gateway"
+            )
+            record = executions.create_execution(job["id"], source="builtin")
+            claimed = jobs.claim_job_for_fire(
+                job["id"], return_job=True, execution_id=record["id"]
+            )
+            claim_before = dict(claimed["fire_claim"])
+            with executions._transaction() as conn:
+                conn.execute(
+                    "UPDATE executions SET owner_host_id=NULL, process_id=?, pid=?, "
+                    "process_started_at=NULL WHERE id=?",
+                    ("legacy-gateway", 987654, record["id"]),
+                )
+
+        monkeypatch.setattr(executions, "_owner_host_id", lambda: "hermes-dashboard")
+        monkeypatch.setattr(
+            "hermes_cli.profiles.profiles_to_serve",
+            lambda multiplex: [("default", home)],
+        )
+        with patch("gateway.status._pid_exists", return_value=False):
+            assert web_server_mod._recover_interrupted_cron_executions() == 0
+
+        with jobs.use_cron_store(home):
+            assert jobs.get_job(job["id"])["fire_claim"] == claim_before
+        token_check = set_hermes_home_override(home)
+        try:
+            assert executions.latest_execution(job["id"])["status"] == "claimed"
+        finally:
+            reset_hermes_home_override(token_check)
+    finally:
+        reset_hermes_home_override(token)
+
+
 # ---------------------------------------------------------------------------
 # Test 2 — get_status run_in_executor keeps event loop free for other requests
 # ---------------------------------------------------------------------------

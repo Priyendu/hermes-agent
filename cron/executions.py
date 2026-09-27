@@ -187,15 +187,22 @@ def _process_start_time(pid: int) -> Optional[int]:
 def _owner_is_live(
     pid: int, started_at: Optional[int], owner_host_id: Optional[str] = None
 ) -> bool:
-    current_host_id = _owner_host_id()
-    if owner_host_id and current_host_id and owner_host_id != current_host_id:
+    owner_identity = str(owner_host_id or "").strip()
+    current_identity = str(_owner_host_id() or "").strip()
+    if owner_identity and current_identity and owner_identity != current_identity:
         return True  # a remote PID cannot be disproved from this host
 
-    # Preserve the pre-identity PID recovery when either side lacks the newer
-    # host marker. Production historically ran with an ephemeral Docker
-    # hostname and no HERMES_MACHINE_ID; refusing all such rows strands the
-    # very claims this reaper exists to recover. PID/start-time checks remain
-    # the authority in this compatibility case.
+    # A migrated legacy execution has no owner identity. If this reaper does
+    # have an identity, it cannot establish that the row came from its PID
+    # namespace; local PID absence/start-time mismatch is not evidence about a
+    # gateway in another container sharing the same execution ledger.
+    if bool(owner_identity) != bool(current_identity):
+        return True
+
+    # Preserve legacy PID recovery when neither side has an identity. This is
+    # the historical single-namespace compatibility case; deployments with
+    # multiple claim owners sharing a store must configure distinct stable
+    # identities so an untagged owner is not mistaken for a local process.
     try:
         from gateway.status import _pid_exists
         if not _pid_exists(pid):
