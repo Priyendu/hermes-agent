@@ -19,7 +19,11 @@ from unittest.mock import patch
 
 import pytest
 
-from tools.cronjob_tools import cronjob, _execute_job_now
+from tools.cronjob_tools import (
+    cronjob,
+    _execute_job_now,
+    _try_dispatch_background_run,
+)
 from tools.environments.base import set_activity_callback
 
 
@@ -202,6 +206,38 @@ class TestCronjobRunExecutesImmediately:
             "manual-exec", success=False,
             error="manual fire claim not acquired",
         )
+
+    def test_execution_creation_failure_does_not_mutate_job(self):
+        """Setup errors before the durable fire claim cannot mark the job run."""
+        with patch("cron.executions.create_execution",
+                   side_effect=OSError("ledger unavailable")), \
+             patch("tools.cronjob_tools.claim_job_for_fire") as claim, \
+             patch("tools.cronjob_tools.mark_job_run") as mark:
+            result = _execute_job_now(dict(_JOB))
+
+        assert result["claimed"] is True
+        assert result["success"] is False
+        assert "ledger unavailable" in result["error"]
+        claim.assert_not_called()
+        mark.assert_not_called()
+
+    def test_background_execution_creation_failure_does_not_mutate_job(self):
+        """Background setup errors likewise leave another owner's state alone."""
+        with patch("gateway.session_context.async_delivery_supported",
+                   return_value=True), \
+             patch("tools.approval.get_current_session_key", return_value="agent:test"), \
+             patch("cron.executions.recover_interrupted_executions", return_value=0), \
+             patch("cron.executions.create_execution",
+                   side_effect=OSError("ledger unavailable")), \
+             patch("tools.cronjob_tools.claim_job_for_fire") as claim, \
+             patch("tools.cronjob_tools.mark_job_run") as mark:
+            result = _try_dispatch_background_run(dict(_JOB))
+
+        assert result["claimed"] is True
+        assert result["dispatched"] is False
+        assert "ledger unavailable" in result["error"]
+        claim.assert_not_called()
+        mark.assert_not_called()
 
     def test_run_action_claims_and_fires_via_run_one_job(self):
         """action='run' must claim the job then fire it through run_one_job."""
