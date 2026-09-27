@@ -210,7 +210,11 @@ def _owner_is_live(
     except Exception:
         return True  # fail safe: inability to prove death must not rewrite state
     if started_at is None:
-        return pid == os.getpid()
+        # A PID confirmed to exist but lacking its start-time identity may be
+        # a live peer in this host namespace.  We cannot distinguish that
+        # peer from a recycled PID, so preserve its claim rather than infer
+        # death from the fact that it is not this reaper process.
+        return True
     current = _process_start_time(pid)
     if current is None:
         # Failure to read process start time is not evidence that a matching

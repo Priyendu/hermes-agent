@@ -566,6 +566,35 @@ class TestTickReapsDeadOwnerClaims:
 
         assert executions.latest_execution("live-job")["status"] == "running"
 
+    def test_live_peer_with_missing_start_time_is_preserved(self, executions, monkeypatch):
+        """An existing peer PID is not dead merely because /proc metadata failed."""
+        import os
+        import cron.jobs as jobs
+        import gateway.status as status
+
+        monkeypatch.setattr(executions, "_owner_host_id", lambda: "same-host")
+        monkeypatch.setattr(status, "_pid_exists", lambda _pid: True)
+        monkeypatch.setattr(executions, "_process_start_time", lambda _pid: None)
+        job = jobs.create_job(
+            prompt="x", schedule="every 1m", name="live-peer-no-start-time",
+        )
+        record = executions.create_execution(job["id"], source="builtin")
+        executions.mark_execution_running(record["id"])
+        claimed = jobs.claim_job_for_fire(
+            job["id"], return_job=True, execution_id=record["id"],
+        )
+        claim_before = dict(claimed["fire_claim"])
+        with executions._transaction() as conn:
+            conn.execute(
+                "UPDATE executions SET process_id='live-peer', pid=?, "
+                "process_started_at=NULL WHERE id=?",
+                (max(1, os.getpid() + 1), record["id"]),
+            )
+
+        assert executions.recover_interrupted_executions() == 0
+        assert executions.latest_execution(job["id"])["status"] == "running"
+        assert jobs.get_job(job["id"])["fire_claim"] == claim_before
+
     def test_reap_is_throttled_between_ticks(self, monkeypatch, executions):
         calls = []
         monkeypatch.setattr(
