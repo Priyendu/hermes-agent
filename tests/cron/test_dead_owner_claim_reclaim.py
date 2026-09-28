@@ -19,9 +19,11 @@ Two-part fix under test here:
 
 from __future__ import annotations
 
+import sqlite3
 import subprocess
 import sys
 import time
+from datetime import timedelta
 from unittest.mock import patch
 
 import pytest
@@ -80,6 +82,170 @@ def _run_tick():
         patch("tools.mcp_tool._kill_orphaned_mcp_children", lambda: None),
     ):
         return scheduler_mod.tick(verbose=False)
+
+
+def _seed_pre_identity_owner(executions, *, status, lease_kind, bound=False):
+    """Create real old-schema state, including a prior cleanup-retry candidate."""
+    import cron.jobs as jobs
+
+    job = jobs.create_job(
+        prompt="migration fixture",
+        schedule="in 30m" if lease_kind == "run" else "every 1m",
+        name="pre-identity-owner",
+    )
+    if lease_kind == "run":
+        assert jobs.claim_dispatch(job["id"])
+    now = jobs._hermes_now()
+    claimed_at = (now - timedelta(seconds=3)).isoformat()
+    claim = {"at": (now - timedelta(seconds=2)).isoformat(), "by": "old-owner"}
+    if bound:
+        claim["execution_id"] = "legacy-active"
+    records = jobs.load_jobs()
+    persisted = next(row for row in records if row["id"] == job["id"])
+    persisted["fire_claim"] = dict(claim)
+    if lease_kind == "run":
+        persisted["run_claim"] = dict(claim)
+    jobs.save_jobs(records)
+    before_job = jobs.get_job(job["id"])
+
+    path = executions.EXECUTIONS_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """CREATE TABLE executions (
+                id TEXT PRIMARY KEY, job_id TEXT NOT NULL, source TEXT NOT NULL,
+                process_id TEXT NOT NULL, pid INTEGER NOT NULL,
+                process_started_at INTEGER, status TEXT NOT NULL,
+                claimed_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,
+                error TEXT
+            )"""
+        )
+        conn.execute(
+            "INSERT INTO executions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("legacy-active", job["id"], "builtin", "legacy-exited-owner",
+             _dead_pid(), None, status, claimed_at,
+             claimed_at if status == "running" else None, None, None),
+        )
+        # Its window includes the unbound lease. Cleanup must consult the
+        # unresolved active row rather than mistake this old attempt for owner.
+        conn.execute(
+            "INSERT INTO executions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("prior-recovered", job["id"], "builtin", "previous-owner", 1,
+             None, "unknown", (now - timedelta(seconds=4)).isoformat(), None,
+             now.isoformat(), "Scheduler restarted after this execution's owner exited"),
+        )
+        before_rows = conn.execute("SELECT * FROM executions ORDER BY id").fetchall()
+        assert "owner_host_id" not in {
+            row[1] for row in conn.execute("PRAGMA table_info(executions)")
+        }
+    return job["id"], before_job, before_rows
+
+
+class TestPreIdentityLedgerMigration:
+    @pytest.mark.parametrize("identity", ["hermes-prod-boston-01", "hermes-dashboard"])
+    @pytest.mark.parametrize("status", ["claimed", "running"])
+    @pytest.mark.parametrize("lease_kind", ["fire", "run"])
+    @pytest.mark.parametrize("bound", [False, True], ids=["legacy-lease", "bound-lease"])
+    def test_identified_service_migrates_but_preserves_unresolved_owner(
+        self, executions, monkeypatch, identity, status, lease_kind, bound
+    ):
+        """Actual ALTER + recovery retry must preserve old rows and exact leases."""
+        import cron.jobs as jobs
+        from gateway.status import _pid_exists
+
+        monkeypatch.setenv("HERMES_MACHINE_ID", identity)
+        job_id, before_job, before_rows = _seed_pre_identity_owner(
+            executions, status=status, lease_kind=lease_kind, bound=bound
+        )
+        with patch("gateway.status._pid_exists", wraps=_pid_exists) as pid_probe:
+            assert executions.recover_interrupted_executions() == 0
+            # Repeat against the already migrated schema and prior recovery row.
+            assert executions.recover_interrupted_executions() == 0
+        pid_probe.assert_not_called()
+
+        with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
+            after_rows = conn.execute("SELECT * FROM executions ORDER BY id").fetchall()
+            assert [row[:-1] for row in after_rows] == before_rows
+            assert all(row[-1] is None for row in after_rows)
+            assert "owner_host_id" in {
+                row[1] for row in conn.execute("PRAGMA table_info(executions)")
+            }
+        assert executions.has_active_execution(job_id)
+        assert jobs.get_job(job_id) == before_job
+
+    @pytest.mark.parametrize("status", ["claimed", "running"])
+    @pytest.mark.parametrize("lease_kind", ["fire", "run"])
+    def test_unidentified_single_namespace_can_recover_migrated_dead_owner(
+        self, executions, monkeypatch, status, lease_kind
+    ):
+        """Migration must not disable the deliberately retained compatibility case."""
+        import cron.jobs as jobs
+
+        monkeypatch.setattr(executions.socket, "gethostname", lambda: "0123456789ab")
+        with patch("hermes_cli.config.load_config_readonly", return_value={"cron": {}}):
+            assert executions._owner_host_id() is None
+            job_id, before_job, _ = _seed_pre_identity_owner(
+                executions, status=status, lease_kind=lease_kind
+            )
+            assert executions.recover_interrupted_executions() == 1
+            assert executions.recover_interrupted_executions() == 0
+        with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
+            row = conn.execute(
+                "SELECT status, finished_at, owner_host_id FROM executions WHERE id=?",
+                ("legacy-active",),
+            ).fetchone()
+        assert row[0] == "unknown"
+        assert row[1]
+        assert row[2] is None
+        assert not executions.has_active_execution(job_id)
+        after_job = jobs.get_job(job_id)
+        assert after_job["fire_claim"] is None
+        if lease_kind == "run":
+            assert after_job["run_claim"] is None
+            assert after_job["repeat"] == before_job["repeat"]
+            assert after_job["repeat"]["completed"] == after_job["repeat"]["times"]
+            assert jobs.claim_dispatch(job_id) is False
+
+    @pytest.mark.parametrize("identity", ["hermes-prod-boston-01", "hermes-dashboard"])
+    @pytest.mark.parametrize("status", ["claimed", "running"])
+    def test_terminal_old_owner_is_not_backfilled_and_new_owner_can_recover(
+        self, executions, monkeypatch, identity, status
+    ):
+        """Simulate genuine completion only in the fixture, then introduce identity."""
+        import cron.jobs as jobs
+
+        with monkeypatch.context() as legacy_context:
+            legacy_context.setattr(executions, "_owner_host_id", lambda: None)
+            job_id, _, _ = _seed_pre_identity_owner(
+                executions, status=status, lease_kind="fire"
+            )
+            terminal = executions.finish_execution("legacy-active", success=True)
+            assert terminal["status"] == "completed"
+            assert not executions.has_active_execution(job_id)
+        # Restore the real resolver: newly acquired executions get identity,
+        # while the terminal old row is never retrospectively assigned one.
+        monkeypatch.setenv("HERMES_MACHINE_ID", identity)
+        new_job = jobs.create_job(prompt="x", schedule="every 1m", name="identified-owner")
+        row = executions.create_execution(new_job["id"], source="builtin")
+        assert jobs.claim_job_for_fire(new_job["id"], execution_id=row["id"])
+        with executions._transaction() as conn:
+            assert conn.execute(
+                "SELECT owner_host_id FROM executions WHERE id=?", (row["id"],)
+            ).fetchone()[0] == identity
+            assert conn.execute(
+                "SELECT owner_host_id FROM executions WHERE id='legacy-active'"
+            ).fetchone()[0] is None
+            conn.execute(
+                "UPDATE executions SET process_id='exited-new-owner', pid=?, "
+                "process_started_at=NULL WHERE id=?", (_dead_pid(), row["id"]),
+            )
+        assert executions.recover_interrupted_executions() == 1
+        assert executions.latest_execution(new_job["id"])["status"] == "unknown"
+        assert jobs.get_job(new_job["id"])["fire_claim"] is None
+        with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
+            assert conn.execute(
+                "SELECT status, owner_host_id FROM executions WHERE id='legacy-active'"
+            ).fetchone() == ("completed", None)
 
 
 class TestTickReapsDeadOwnerClaims:
