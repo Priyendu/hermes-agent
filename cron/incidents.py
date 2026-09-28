@@ -23,6 +23,7 @@ connect and a missing database never raises (directories are created).
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import sqlite3
 import threading
@@ -47,7 +48,6 @@ _FAILURE_TYPE_ORDER = (
     ("agent", ("agent", "model", "provider", "inference")),
 )
 MAX_ERROR_CHARS = 500
-_MAX_SIGNATURE_ERROR_CHARS = 200
 
 _lock = threading.RLock()
 
@@ -149,10 +149,19 @@ def _redact_error(error: str) -> str:
 
 
 def _error_signature(job_id: str, error: str) -> str:
-    """Dedup key: stable for same job + same normalized error prefix."""
-    normalized = _normalize_error(error)[:_MAX_SIGNATURE_ERROR_CHARS]
-    digest = hashlib.sha256(job_id.encode() + normalized.encode()).hexdigest()
-    return digest[:12]
+    """Versioned full-error identity; display truncation is never dedup evidence.
+
+    JSON framing prevents ambiguous job/error concatenation. Keep the existing
+    case/whitespace normalization, but sign every normalized character using
+    the full digest. Legacy prefix-based acknowledgements cannot establish
+    sameness and deliberately remain historical rather than closing v2 rows.
+    """
+    payload = json.dumps(
+        ["cron.failure.v2", job_id, _normalize_error(error)],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    return "v2_" + hashlib.sha256(payload).hexdigest()
 
 
 def _incident_id(job_id: str, error_sig: str) -> str:
