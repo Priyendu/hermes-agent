@@ -9,6 +9,7 @@ E2E-over-mocks discipline for file-touching code.
 """
 import threading
 import time
+from unittest.mock import patch
 
 import pytest
 
@@ -175,6 +176,132 @@ def test_stale_fire_owner_cannot_mark_replacement_run(temp_home):
     persisted = jobs.get_job(job["id"])
     assert persisted["fire_claim"]["by"] == "replacement"
     assert persisted.get("last_run_at") is None
+
+
+def test_unstarted_manual_release_requires_exact_execution_and_owner(temp_home):
+    import cron.jobs as jobs
+
+    job = jobs.create_job(prompt="x", schedule="every 5m", name="manual-release")
+    claimed = jobs.claim_job_for_fire(
+        job["id"], return_job=True, execution_id="exec-1",
+    )
+    claim = dict(claimed["fire_claim"])
+
+    assert not jobs.release_unstarted_manual_fire_claim(
+        job["id"], execution_id="replacement-exec", expected_owner=claim["by"],
+    )
+    assert not jobs.release_unstarted_manual_fire_claim(
+        job["id"], execution_id="exec-1", expected_owner="replacement-owner",
+    )
+    assert jobs.get_job(job["id"])["fire_claim"] == claim
+
+    assert jobs.release_unstarted_manual_fire_claim(
+        job["id"], execution_id="exec-1", expected_owner=claim["by"],
+    )
+    assert jobs.get_job(job["id"])["fire_claim"] is None
+
+
+def test_claim_attribution_uses_configured_machine_id(monkeypatch):
+    import cron.jobs as jobs
+
+    monkeypatch.delenv("HERMES_MACHINE_ID", raising=False)
+    with patch("socket.gethostname", return_value="0123456789ab"), patch(
+        "hermes_cli.config.load_config_readonly",
+        return_value={"cron": {"machine_id": "stable-config-host"}},
+    ):
+        assert jobs._machine_id() == "stable-config-host"
+
+
+def test_one_shot_run_claim_links_only_to_exact_owner_timestamp_and_execution(
+    temp_home,
+):
+    import cron.jobs as jobs
+
+    job = jobs.create_job(prompt="x", schedule="in 30m", name="link-run-claim")
+    records = jobs.load_jobs()
+    record = next(row for row in records if row["id"] == job["id"])
+    record["run_claim"] = {
+        "at": "2026-09-25T12:00:00+00:00",
+        "by": "runner-a",
+    }
+    jobs.save_jobs(records)
+
+    assert not jobs.link_run_claim_to_execution(
+        job["id"], execution_id="exec-1", expected_owner="runner-b",
+        expected_at="2026-09-25T12:00:00+00:00",
+    )
+    assert not jobs.link_run_claim_to_execution(
+        job["id"], execution_id="exec-1", expected_owner="runner-a",
+        expected_at="2026-09-25T12:00:01+00:00",
+    )
+    assert jobs.link_run_claim_to_execution(
+        job["id"], execution_id="exec-1", expected_owner="runner-a",
+        expected_at="2026-09-25T12:00:00+00:00",
+    )
+    assert jobs.link_run_claim_to_execution(
+        job["id"], execution_id="exec-1", expected_owner="runner-a",
+        expected_at="2026-09-25T12:00:00+00:00",
+    )
+    assert not jobs.link_run_claim_to_execution(
+        job["id"], execution_id="exec-2", expected_owner="runner-a",
+        expected_at="2026-09-25T12:00:00+00:00",
+    )
+    assert jobs.get_job(job["id"])["run_claim"]["execution_id"] == "exec-1"
+
+
+def test_one_shot_run_claim_clear_is_fenced_to_exact_execution(temp_home):
+    import cron.jobs as jobs
+
+    job = jobs.create_job(prompt="x", schedule="in 30m", name="fenced-run-claim")
+    records = jobs.load_jobs()
+    record = next(row for row in records if row["id"] == job["id"])
+    record["run_claim"] = {
+        "at": "2026-09-25T12:00:00+00:00",
+        "by": "runner-a",
+        "execution_id": "exec-current",
+    }
+    jobs.save_jobs(records)
+
+    assert not jobs.clear_run_claim_for_execution(
+        job["id"], execution_id="exec-stale",
+    )
+    assert jobs.get_job(job["id"])["run_claim"]["execution_id"] == "exec-current"
+
+    assert jobs.clear_run_claim_for_execution(
+        job["id"], execution_id="exec-current",
+    )
+    assert jobs.get_job(job["id"])["run_claim"] is None
+
+
+def test_dispatch_cleanup_preserves_replacement_one_shot_claim(temp_home):
+    import cron.jobs as jobs
+
+    job = jobs.create_job(prompt="x", schedule="in 30m", name="replacement-run-claim")
+    original_at = "2026-09-25T12:00:00+00:00"
+    replacement_at = "2026-09-25T12:00:01+00:00"
+    records = jobs.load_jobs()
+    record = next(row for row in records if row["id"] == job["id"])
+    record["run_claim"] = {
+        "at": replacement_at,
+        "by": "runner-b",
+        "execution_id": "exec-b",
+    }
+    jobs.save_jobs(records)
+
+    assert not jobs.clear_run_claim_if_matches(
+        job["id"], expected_owner="runner-a", expected_at=original_at,
+    )
+    assert jobs.get_job(job["id"])["run_claim"] == {
+        "at": replacement_at,
+        "by": "runner-b",
+        "execution_id": "exec-b",
+    }
+
+    assert jobs.clear_run_claim_if_matches(
+        job["id"], expected_owner="runner-b", expected_at=replacement_at,
+        expected_execution_id="exec-b",
+    )
+    assert jobs.get_job(job["id"])["run_claim"] is None
 
 
 def test_fire_claim_fence_serializes_terminal_revocation(temp_home):

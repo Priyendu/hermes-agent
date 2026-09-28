@@ -2687,6 +2687,11 @@ DEFAULT_CONFIG = {
     },
 
     "cron": {
+        # Stable identity for this cron-owning machine across process/container
+        # recreation. Required only when the host has no stable hostname or
+        # multiple machines share one execution ledger; keep it unique per
+        # concurrently active machine.
+        "machine_id": "",
         # Allow cron-spawned agents to use the cronjob toolset (create/edit/
         # remove scheduled jobs from within a cron run — the "cron-librarian"
         # pattern). Off by default: the cronjob toolset is policy-denied in

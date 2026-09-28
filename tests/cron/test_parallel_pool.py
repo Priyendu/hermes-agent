@@ -131,7 +131,10 @@ class TestRunningJobGuard:
         result = callback()
         future.set_result(result)
 
-        assert claim_calls == [("queued-job", {"return_job": True})]
+        assert claim_calls == [(
+            "queued-job",
+            {"return_job": True, "execution_id": "execution-1"},
+        )]
         assert "queued-job" not in sched._running_job_ids
 
 
@@ -182,12 +185,24 @@ class TestRunningJobGuard:
             sched,
             "claim_job_for_fire",
             lambda job_id, **_kw: dict(
-                healthy_job, fire_claim={"by": "test-owner", "at": "now"}
+                healthy_job,
+                fire_claim={
+                    "by": "test-owner",
+                    "at": "now",
+                    "execution_id": _kw.get("execution_id"),
+                },
             )
             if job_id == "healthy-job"
             else None,
         )
-        monkeypatch.setattr(sched, "mark_execution_running", lambda *_a, **_kw: None)
+        monkeypatch.setattr(
+            sched,
+            "mark_execution_running",
+            lambda execution_id, **_kw: {
+                "id": execution_id,
+                "status": "running",
+            },
+        )
         monkeypatch.setattr(sched, "heartbeat_fire_claim", lambda *_a, **_kw: True)
 
         n = sched.tick(verbose=False)

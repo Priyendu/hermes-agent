@@ -209,7 +209,7 @@ class CronScheduler(ABC):
         from cron.jobs import claim_job_for_fire
 
         execution = create_execution(job_id, source=self.name)
-        claim_kwargs = {"return_job": True}
+        claim_kwargs = {"return_job": True, "execution_id": execution["id"]}
         if force:
             claim_kwargs["force"] = True
         try:

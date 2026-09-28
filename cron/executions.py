@@ -7,11 +7,14 @@ proved gone. Terminal states are immutable.
 
 from __future__ import annotations
 
+import logging
 import os
+import socket
 import sqlite3
 import threading
 import uuid
 from contextlib import contextmanager
+from datetime import timedelta
 from typing import Any, Dict, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
@@ -25,6 +28,45 @@ MAX_TERMINAL_EXECUTIONS = 1000
 _TERMINAL_STATES = ("completed", "failed", "unknown")
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
+logger = logging.getLogger(__name__)
+
+
+def _owner_host_id() -> Optional[str]:
+    """Return the deployment's stable host identity, or fail closed.
+
+    A service-specific internal identity or stable hostname distinguishes
+    concurrently active PID namespaces. A profile-level configured identity
+    is a fallback only for deployments with an unstable hostname; it must not
+    override a stable service hostname because several services can share one
+    profile/config while using isolated PID namespaces. Docker-generated hex
+    container IDs are not stable, so without another identity the owner is
+    indeterminate and is preserved.
+    """
+    internal_identity = os.getenv("HERMES_MACHINE_ID", "").strip()
+    if internal_identity:
+        return internal_identity
+    try:
+        hostname = socket.gethostname().strip()
+    except Exception:
+        return None
+    if hostname and not (12 <= len(hostname) <= 64
+                         and all(char in "0123456789abcdefABCDEF"
+                                 for char in hostname)):
+        return hostname
+
+    # This profile-level fallback is useful for single-identity deployments
+    # with ephemeral hostnames. Stable service hostnames/internal identities
+    # take precedence when several PID namespaces share the profile.
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cron_config = (load_config_readonly() or {}).get("cron") or {}
+        value = cron_config.get("machine_id", "")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    except Exception:
+        pass
+    return None
 
 
 def _connect() -> sqlite3.Connection:
@@ -48,6 +90,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
              job_id TEXT NOT NULL,
              source TEXT NOT NULL,
              process_id TEXT NOT NULL,
+             owner_host_id TEXT,
              pid INTEGER NOT NULL,
              process_started_at INTEGER,
              status TEXT NOT NULL CHECK(status IN
@@ -58,6 +101,29 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
              error TEXT
            )"""
     )
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(executions)").fetchall()
+    }
+    if "owner_host_id" not in columns:
+        # Serialize the check-and-ALTER across processes. The initial check is
+        # only a fast path; after acquiring SQLite's write reservation, re-read
+        # the schema because another process may have completed the migration.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            columns = {
+                row[1]
+                for row in conn.execute(
+                    "PRAGMA table_info(executions)"
+                ).fetchall()
+            }
+            if "owner_host_id" not in columns:
+                conn.execute(
+                    "ALTER TABLE executions ADD COLUMN owner_host_id TEXT"
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_job_claimed "
         "ON executions(job_id, claimed_at DESC, id DESC)"
@@ -90,7 +156,12 @@ def _transaction() -> Iterator[sqlite3.Connection]:
 
 
 def _record(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
-    return dict(row) if row is not None else None
+    if row is None:
+        return None
+    record = dict(row)
+    # Internal liveness metadata is not part of the public execution record.
+    record.pop("owner_host_id", None)
+    return record
 
 
 def _emit_execution_state(
@@ -113,7 +184,25 @@ def _process_start_time(pid: int) -> Optional[int]:
         return None
 
 
-def _owner_is_live(pid: int, started_at: Optional[int]) -> bool:
+def _owner_is_live(
+    pid: int, started_at: Optional[int], owner_host_id: Optional[str] = None
+) -> bool:
+    owner_identity = str(owner_host_id or "").strip()
+    current_identity = str(_owner_host_id() or "").strip()
+    if owner_identity and current_identity and owner_identity != current_identity:
+        return True  # a remote PID cannot be disproved from this host
+
+    # A migrated legacy execution has no owner identity. If this reaper does
+    # have an identity, it cannot establish that the row came from its PID
+    # namespace; local PID absence/start-time mismatch is not evidence about a
+    # gateway in another container sharing the same execution ledger.
+    if bool(owner_identity) != bool(current_identity):
+        return True
+
+    # Preserve legacy PID recovery when neither side has an identity. This is
+    # the historical single-namespace compatibility case; deployments with
+    # multiple claim owners sharing a store must configure distinct stable
+    # identities so an untagged owner is not mistaken for a local process.
     try:
         from gateway.status import _pid_exists
         if not _pid_exists(pid):
@@ -121,9 +210,17 @@ def _owner_is_live(pid: int, started_at: Optional[int]) -> bool:
     except Exception:
         return True  # fail safe: inability to prove death must not rewrite state
     if started_at is None:
-        return pid == os.getpid()
+        # A PID confirmed to exist but lacking its start-time identity may be
+        # a live peer in this host namespace.  We cannot distinguish that
+        # peer from a recycled PID, so preserve its claim rather than infer
+        # death from the fact that it is not this reaper process.
+        return True
     current = _process_start_time(pid)
-    return current is not None and current == started_at
+    if current is None:
+        # Failure to read process start time is not evidence that a matching
+        # PID is dead; preserve the claim and retry on a later reap.
+        return True
+    return current == started_at
 
 
 def _prune_unlocked(conn: sqlite3.Connection) -> None:
@@ -146,10 +243,11 @@ def create_execution(job_id: str, *, source: str) -> Dict[str, Any]:
     with _transaction() as conn:
         conn.execute(
             """INSERT INTO executions
-               (id, job_id, source, process_id, pid, process_started_at,
+               (id, job_id, source, process_id, owner_host_id, pid, process_started_at,
                 status, claimed_at)
-               VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?)""",
-            (execution_id, str(job_id), str(source), _PROCESS_ID, pid,
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'claimed', ?)""",
+            (execution_id, str(job_id), str(source), _PROCESS_ID,
+             _owner_host_id(), pid,
              _process_start_time(pid), now),
         )
         row = conn.execute(
@@ -203,19 +301,36 @@ def finish_execution(
 
 
 def recover_interrupted_executions() -> int:
-    """Mark provably abandoned attempts unknown without scheduling retries."""
+    """Mark proven-dead attempts unknown and reconcile only their exact leases.
+
+    A recurring job's next fire is already advanced at claim time, so a dead
+    owner may release its lease whether it died before or during execution.
+    One-shot dispatch remains protected by ``claim_dispatch``. Reconciliation
+    retries are bounded to recently recovered rows so old unknown history does
+    not trigger a jobs.json scan on every reap.
+    """
     now = _hermes_now().isoformat()
     changed = 0
     recovered: List[Dict[str, Any]] = []
+    claim_recovery_candidates: List[Dict[str, Any]] = []
+    from cron.jobs import _oneshot_run_claim_ttl_seconds
+
+    cutoff = (
+        _hermes_now()
+        - timedelta(seconds=max(1.0, _oneshot_run_claim_ttl_seconds()))
+    ).isoformat()
     with _transaction() as conn:
         rows = conn.execute(
-            """SELECT id, process_id, pid, process_started_at FROM executions
+            """SELECT id, job_id, process_id, owner_host_id, pid, process_started_at,
+                      claimed_at, started_at FROM executions
                WHERE status IN ('claimed','running')"""
         ).fetchall()
         for row in rows:
             if row["process_id"] == _PROCESS_ID:
                 continue
-            if _owner_is_live(int(row["pid"]), row["process_started_at"]):
+            if _owner_is_live(
+                int(row["pid"]), row["process_started_at"], row["owner_host_id"]
+            ):
                 continue
             cur = conn.execute(
                 """UPDATE executions SET status='unknown', finished_at=?, error=?
@@ -232,8 +347,44 @@ def recover_interrupted_executions() -> int:
                 ).fetchone())
                 if record is not None:
                     recovered.append(record)
+        # Revisit only recent unknown rows produced by this recovery path, so a
+        # transient jobs.json lock/write failure can be retried without
+        # scanning the entire historical execution ledger on every tick.
+        claim_recovery_candidates = [
+            dict(row)
+            for row in conn.execute(
+                """SELECT id, job_id, owner_host_id, claimed_at, finished_at
+                   FROM executions
+                   WHERE status='unknown' AND finished_at >= ?
+                     AND error LIKE 'Scheduler restarted after this execution%'
+                   ORDER BY finished_at DESC LIMIT ?""",
+                (cutoff, MAX_TERMINAL_EXECUTIONS),
+            ).fetchall()
+        ]
+        # Capture claim candidates before pruning. The execution retention cap
+        # must not erase the just-recovered ledger row before its matching
+        # durable lease has had a chance to be reconciled.
         if changed:
             _prune_unlocked(conn)
+
+    from cron.jobs import clear_recovered_fire_claim
+
+    for record in claim_recovery_candidates:
+        try:
+            clear_recovered_fire_claim(
+                record["job_id"],
+                execution_id=record["id"],
+                owner_host_id=record["owner_host_id"],
+                execution_claimed_at=record["claimed_at"],
+                recovery_finished_at=record["finished_at"],
+            )
+        except Exception:
+            logger.warning(
+                "Could not reconcile fire claim for recovered cron execution %s",
+                record["id"],
+                exc_info=True,
+            )
+
     for record in recovered:
         _emit_execution_state(record)
     return changed
@@ -260,7 +411,7 @@ def list_executions(
             + " ORDER BY claimed_at DESC, id DESC LIMIT ?",
             params,
         ).fetchall()
-    return [dict(row) for row in rows]
+    return [record for row in rows if (record := _record(row)) is not None]
 
 
 def latest_execution(job_id: str) -> Optional[Dict[str, Any]]:
@@ -283,4 +434,19 @@ def latest_executions(job_ids: List[str]) -> Dict[str, Dict[str, Any]]:
                             ORDER BY e2.claimed_at DESC, e2.id DESC LIMIT 1)""",
             clean,
         ).fetchall()
-    return {row["job_id"]: dict(row) for row in rows}
+    return {
+        record["job_id"]: record
+        for row in rows
+        if (record := _record(row)) is not None
+    }
+
+
+def has_active_execution(job_id: str) -> bool:
+    """Whether a job currently has a claimed or running owner in the ledger."""
+    with _transaction() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM executions WHERE job_id=? "
+            "AND status IN ('claimed','running') LIMIT 1",
+            (str(job_id),),
+        ).fetchone()
+    return row is not None

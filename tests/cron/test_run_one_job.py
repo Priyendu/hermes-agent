@@ -78,6 +78,24 @@ def test_run_one_job_success_sequence(monkeypatch):
     assert calls[-1] == ("mark", "j2", True)
 
 
+def test_run_one_job_aborts_before_side_effects_when_running_cas_is_lost(monkeypatch):
+    """A reaper-won terminal transition must fence all executor side effects."""
+    calls = []
+    monkeypatch.setattr(
+        s, "create_execution", lambda *_a, **_kw: {"id": "exec-lost"}
+    )
+    monkeypatch.setattr(s, "claim_dispatch", lambda _job_id: True)
+    monkeypatch.setattr(s, "mark_execution_running", lambda _execution_id: None)
+    monkeypatch.setattr(s, "run_job", lambda *_a, **_kw: calls.append("run_job"))
+    monkeypatch.setattr(s, "save_job_output", lambda *_a, **_kw: calls.append("save"))
+    monkeypatch.setattr(s, "_deliver_result", lambda *_a, **_kw: calls.append("deliver"))
+    monkeypatch.setattr(s, "mark_job_run", lambda *_a, **_kw: calls.append("mark"))
+    monkeypatch.setattr(s, "finish_execution", lambda *_a, **_kw: calls.append("finish"))
+
+    assert s.run_one_job({"id": "lost", "name": "stale snapshot"}) is True
+    assert calls == []
+
+
 def test_run_one_job_exception_delivers_failure_alert(monkeypatch):
     """An exception escaping the run body must not become a silent error row."""
     delivered = []
@@ -88,7 +106,9 @@ def test_run_one_job_exception_delivers_failure_alert(monkeypatch):
         s, "create_execution", lambda *_a, **_kw: {"id": "exec-j3"}
     )
     monkeypatch.setattr(s, "claim_dispatch", lambda _job_id: True)
-    monkeypatch.setattr(s, "mark_execution_running", lambda _execution_id: None)
+    monkeypatch.setattr(
+        s, "mark_execution_running", lambda execution_id: {"id": execution_id}
+    )
     monkeypatch.setattr(
         s,
         "run_job",
@@ -141,7 +161,9 @@ def test_run_one_job_exception_records_failure_alert_delivery_error(monkeypatch)
         s, "create_execution", lambda *_a, **_kw: {"id": "exec-j4"}
     )
     monkeypatch.setattr(s, "claim_dispatch", lambda _job_id: True)
-    monkeypatch.setattr(s, "mark_execution_running", lambda _execution_id: None)
+    monkeypatch.setattr(
+        s, "mark_execution_running", lambda execution_id: {"id": execution_id}
+    )
     monkeypatch.setattr(
         s,
         "run_job",
@@ -165,7 +187,9 @@ def _patch_escaped_failure(monkeypatch, delivered, *, exec_id, err):
     """Make run_job raise, and capture what the escape handler delivers."""
     monkeypatch.setattr(s, "create_execution", lambda *_a, **_kw: {"id": exec_id})
     monkeypatch.setattr(s, "claim_dispatch", lambda _job_id: True)
-    monkeypatch.setattr(s, "mark_execution_running", lambda _execution_id: None)
+    monkeypatch.setattr(
+        s, "mark_execution_running", lambda execution_id: {"id": execution_id}
+    )
     monkeypatch.setattr(
         s,
         "run_job",
@@ -246,7 +270,9 @@ def test_run_one_job_exception_after_delivery_does_not_redeliver(monkeypatch):
         s, "create_execution", lambda *_a, **_kw: {"id": "exec-j5"}
     )
     monkeypatch.setattr(s, "claim_dispatch", lambda _job_id: True)
-    monkeypatch.setattr(s, "mark_execution_running", lambda _execution_id: None)
+    monkeypatch.setattr(
+        s, "mark_execution_running", lambda execution_id: {"id": execution_id}
+    )
     monkeypatch.setattr(
         s,
         "run_job",
@@ -288,7 +314,9 @@ def test_run_one_job_keyboard_interrupt_skips_delivery_and_reraises(monkeypatch)
         s, "create_execution", lambda *_a, **_kw: {"id": "exec-j6"}
     )
     monkeypatch.setattr(s, "claim_dispatch", lambda _job_id: True)
-    monkeypatch.setattr(s, "mark_execution_running", lambda _execution_id: None)
+    monkeypatch.setattr(
+        s, "mark_execution_running", lambda execution_id: {"id": execution_id}
+    )
     monkeypatch.setattr(
         s,
         "run_job",

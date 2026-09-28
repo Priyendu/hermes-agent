@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import time
 import threading
+from contextlib import nullcontext
 from unittest.mock import patch
 
 import pytest
@@ -82,6 +83,86 @@ def test_lifespan_warmup_is_synchronous():
         f"but slow import is {SLOW_SECONDS * 1000:.0f} ms — "
         f"warmup is not synchronous."
     )
+
+
+def test_lifespan_recovers_this_servers_interrupted_cron_executions():
+    """The dashboard owns manual trigger leases and must reap at startup."""
+    from fastapi.testclient import TestClient
+
+    with patch.object(
+        web_server_mod, "_recover_interrupted_cron_executions",
+    ) as recover:
+        with TestClient(web_server_mod.app, raise_server_exceptions=False):
+            recover.assert_called_once_with()
+
+
+def test_cron_recovery_visits_every_dashboard_profile(tmp_path):
+    """Every profile triggerable through the dashboard gets its own ledger recovery."""
+    from pathlib import Path
+
+    homes = [tmp_path / "default", tmp_path / "swing"]
+    calls = []
+    with patch(
+        "hermes_cli.profiles.profiles_to_serve",
+        return_value=[("default", homes[0]), ("swing", homes[1])],
+    ), patch(
+        "cron.jobs.use_cron_store",
+        side_effect=lambda home: (calls.append(("store", Path(home))) or nullcontext()),
+    ), patch(
+        "cron.executions.recover_interrupted_executions",
+        side_effect=lambda: calls.append(("recover", None)) or 1,
+    ):
+        assert web_server_mod._recover_interrupted_cron_executions() == 2
+
+    assert calls == [
+        ("store", homes[0]), ("recover", None),
+        ("store", homes[1]), ("recover", None),
+    ]
+
+
+def test_dashboard_recovery_preserves_legacy_gateway_claim_from_other_namespace(
+        tmp_path, monkeypatch):
+    """The real dashboard recovery helper must not reap an unowned foreign PID."""
+    import cron.executions as executions
+    import cron.jobs as jobs
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    home = tmp_path / "default"
+    token = set_hermes_home_override(home)
+    try:
+        with jobs.use_cron_store(home):
+            job = jobs.create_job(
+                prompt="x", schedule="every 1m", name="legacy-gateway"
+            )
+            record = executions.create_execution(job["id"], source="builtin")
+            claimed = jobs.claim_job_for_fire(
+                job["id"], return_job=True, execution_id=record["id"]
+            )
+            claim_before = dict(claimed["fire_claim"])
+            with executions._transaction() as conn:
+                conn.execute(
+                    "UPDATE executions SET owner_host_id=NULL, process_id=?, pid=?, "
+                    "process_started_at=NULL WHERE id=?",
+                    ("legacy-gateway", 987654, record["id"]),
+                )
+
+        monkeypatch.setattr(executions, "_owner_host_id", lambda: "hermes-dashboard")
+        monkeypatch.setattr(
+            "hermes_cli.profiles.profiles_to_serve",
+            lambda multiplex: [("default", home)],
+        )
+        with patch("gateway.status._pid_exists", return_value=False):
+            assert web_server_mod._recover_interrupted_cron_executions() == 0
+
+        with jobs.use_cron_store(home):
+            assert jobs.get_job(job["id"])["fire_claim"] == claim_before
+        token_check = set_hermes_home_override(home)
+        try:
+            assert executions.latest_execution(job["id"])["status"] == "claimed"
+        finally:
+            reset_hermes_home_override(token_check)
+    finally:
+        reset_hermes_home_override(token)
 
 
 # ---------------------------------------------------------------------------
